@@ -4,17 +4,17 @@ Hotkeys while drawing:  F8 pause/resume | F9 slower | F10 faster | ESC stop
 Emergency stop: slam the mouse into the TOP-LEFT screen corner.
 """
 import sys, os, json, threading, time, queue
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    try: ctypes.windll.shcore.SetProcessDpiAwareness(2)   # must be set before pyautogui/tkinter load
+    except Exception: pass
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox, simpledialog
 import numpy as np
 from PIL import Image, ImageTk, ImageGrab, ImageFilter, ImageEnhance, ImageOps
 import pyautogui
 
-if sys.platform == "win32":
-    try:
-        import ctypes; ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        pass
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     DND = True
@@ -27,6 +27,42 @@ except Exception:
 
 pyautogui.FAILSAFE = True
 pyautogui.MINIMUM_DURATION = 0
+pyautogui.PAUSE = 0
+
+if sys.platform == "win32":
+    class _MI(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _IN(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("mi", _MI)]
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+class Mouse:
+    """Mouse backend. On Windows it uses SendInput (looks like real hardware input); PyAutoGUI is the fallback."""
+    def __init__(self, sendinput=True): self.si = sendinput and sys.platform == "win32"
+
+    @staticmethod
+    def _send(flags, x=0, y=0):
+        i = _IN(0, _IN._U(_MI(x, y, 0, flags, 0, 0)))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_IN))
+
+    def move(self, x, y):
+        if self.si:
+            u = ctypes.windll.user32; vx, vy, vw, vh = (u.GetSystemMetrics(i) for i in (76, 77, 78, 79))
+            self._send(0x8001 | 0x4000, int((x - vx) * 65535 / max(1, vw - 1)), int((y - vy) * 65535 / max(1, vh - 1)))
+        else: pyautogui.moveTo(int(x), int(y))
+
+    def down(self, b="left"):
+        if self.si: self._send(0x0002 if b == "left" else 0x0008)
+        else: pyautogui.mouseDown(button=b)
+
+    def up(self, b="left"):
+        if self.si: self._send(0x0004 if b == "left" else 0x0010)
+        else: pyautogui.mouseUp(button=b)
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
@@ -44,7 +80,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.hk = queue.Queue()
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
-            speed=D(value=70), dragpts=I(value=0), hold=I(value=0), swdelay=D(value=0.15), button=S(value="left"),
+            speed=D(value=70), dragpts=I(value=3), hold=I(value=10), swdelay=D(value=0.15), button=S(value="left"),
+            input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
             invert=B(value=False), bright=D(value=1.0), contrast=D(value=1.0), sat=D(value=1.0), blur=D(value=0),
@@ -141,17 +178,20 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Button(f, text="Clear colours", command=lambda: (self.palette.clear(), self.refresh(), self.sched_prev())).pack(anchor="e")
 
         f, self.st_br = self.card(left, "3  Brush size", "optional")
-        ttk.Button(f, text="Click brush-size buttons", command=self.click_brushes).pack(fill="x")
+        r = ttk.Frame(f); r.pack(fill="x")
+        ttk.Button(r, text="Click brush buttons", command=self.click_brushes).pack(side="left", expand=True, fill="x")
+        ttk.Button(r, text="Auto-measure sizes", command=lambda: self.calibrate(0)).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        ttk.Checkbutton(f, text="Undo test lines with Ctrl+Z", variable=self.v["undo"]).pack(anchor="w")
         r = ttk.Frame(f); r.pack(fill="x", pady=3); ttk.Label(r, text="Use:").pack(side="left")
         self.cb = ttk.Combobox(r, textvariable=self.v["brush"], state="readonly", width=20); self.cb.pack(side="left", padx=4)
         ttk.Button(r, text="Clear", width=6, command=lambda: (self.brushes.clear(), self.refresh())).pack(side="right")
         self.spin(f, "Manual step px", "step", 1, 60)
 
         r = tk.Frame(left, bg=BG); r.pack(fill="x", pady=4)
-        for t, c in (("Preview", self.preview), ("Trace outline", self.trace)):
+        for t, c in (("Preview", self.preview), ("Trace box", self.trace), ("Test line", self.test_stroke)):
             ttk.Button(r, text=t, command=c).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(r, text="Save", width=6, command=self.save_cfg).pack(side="left", padx=2)
-        ttk.Button(r, text="Load", width=6, command=self.load_cfg).pack(side="left", padx=2)
+        ttk.Button(r, text="Save", width=5, command=self.save_cfg).pack(side="left", padx=2)
+        ttk.Button(r, text="Load", width=5, command=self.load_cfg).pack(side="left", padx=2)
         ttk.Button(left, text="START DRAWING", style="Go.TButton", command=self.start).pack(fill="x", padx=2, pady=4)
         self.status = tk.Label(left, text="Ready", bg=BG, fg="#aaa", wraplength=320, justify="left"); self.status.pack(anchor="w")
 
@@ -172,6 +212,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.spin(t, "Colour switch delay", "swdelay", 0, 3, 0.05)
         self.spin(t, "Start countdown (s)", "countdown", 1, 20)
         self.combo(t, "Draw with button", "button", ["left", "right"])
+        self.combo(t, "Mouse input", "input", ["Windows SendInput (best)", "PyAutoGUI (fallback)"])
+        self.check(t, "Nudge mouse on single dots", "nudge")
         ttk.Label(t, text="Tip: if your app skips or breaks strokes, lower the\nspeed or add smooth drag points.", foreground="#999").pack(anchor="w", pady=6)
 
         t = tabs["Image"]
@@ -284,11 +326,97 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     def click_brushes(self):
         def done(pts):
-            for i, (x, y, _) in enumerate(pts):
-                px = simpledialog.askinteger("Brush size", f"Brush button {i+1}: how many pixels wide is this brush?", initialvalue=4 * (i + 1), minvalue=1, maxvalue=200, parent=self)
-                if px: self.brushes.append({"pos": (x, y), "px": px})
-            self.refresh()
+            if not pts: return
+            start = len(self.brushes)
+            self.brushes += [{"pos": (x, y), "px": 0} for x, y, _ in pts]; self.refresh()
+            if self.canvas_box and messagebox.askyesno("Brush sizes", "Measure the brush sizes automatically?\n\nI will draw a short test line with each brush on your canvas, measure its width, then undo it (Ctrl+Z).\nMake sure the canvas is visible and a colour different from the background is selected."):
+                self.calibrate(start)
+            else:
+                for i in range(start, len(self.brushes)):
+                    px = simpledialog.askinteger("Brush size", f"Brush {i+1}: how many pixels wide is it?", initialvalue=4 * (i + 1), minvalue=1, maxvalue=300, parent=self)
+                    self.brushes[i]["px"] = px or 4 * (i + 1)
+                self.refresh()
         self.click_select("Click each brush-size button (smallest to largest).", done)
+
+    def mini_pos(self, w, h):
+        """Pick a screen corner for the mini panel that does not cover the canvas, swatches or brush buttons."""
+        W, H = self.winfo_screenwidth(), self.winfo_screenheight(); b = self.canvas_box or (0, 0, 0, 0)
+        pts = [p["pos"] for p in self.palette] + [q["pos"] for q in self.brushes]; best = None
+        for x, y in ((W - w - 20, H - h - 80), (20, H - h - 80), (W - w - 20, 40), (20, 40)):
+            ov = max(0, min(x + w, b[2]) - max(x, b[0])) * max(0, min(y + h, b[3]) - max(y, b[1]))
+            ov += 10 ** 9 * sum(1 for px, py in pts if x - 15 <= px <= x + w + 15 and y - 15 <= py <= y + h + 15)
+            if best is None or ov < best[0]: best = (ov, x, y)
+        return best[1], best[2]
+
+    def snap(self, box):
+        try: return ImageGrab.grab(bbox=box, all_screens=True).convert("RGB")
+        except TypeError: return ImageGrab.grab(bbox=box).convert("RGB")
+
+    @staticmethod
+    def measure(before, after, c):
+        d = np.abs(np.array(before).astype(int) - np.array(after).astype(int)).sum(2) > 60
+        rows = d.mean(1) > 0.6
+        if not rows[c]:
+            near = [r for r in range(max(0, c - 3), min(len(rows), c + 4)) if rows[r]]
+            if not near: return None
+            c = near[0]
+        s = e = c
+        while s > 0 and rows[s - 1]: s -= 1
+        while e < len(rows) - 1 and rows[e + 1]: e += 1
+        return None if s == 0 or e == len(rows) - 1 else e - s + 1
+
+    def calibrate(self, start=0):
+        if self.drawing: return
+        if not self.canvas_box: return messagebox.showinfo("Canvas", "Select the canvas first - the test lines are drawn on it.")
+        if len(self.brushes) <= start: return messagebox.showinfo("Brushes", "Click your brush-size buttons first.")
+        g = {k: v.get() for k, v in self.v.items()}
+        self.stop = self.paused = False; self.drawing = True
+        self.open_mini(); self.withdraw()
+        threading.Thread(target=self._calib, args=(g, start), daemon=True).start()
+
+    def _calib(self, g, start):
+        res, undo_failed, err = {}, False, ""
+        try:
+            m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box; W, H = b[2] - b[0], b[3] - b[1]
+            idxs = list(range(start, len(self.brushes))); n = len(idxs)
+            for s in range(3, 0, -1):
+                if self.stop: raise KeyboardInterrupt
+                self.ui(f"Measuring brush sizes in {s}s - keep your drawing app visible!"); time.sleep(1)
+            for j, i in enumerate(idxs):
+                self.gate(); self.ui(f"Measuring brush {i+1} ({j+1}/{n})...", j / n)
+                yc = int(b[1] + H * (j + 1) / (n + 1)); half = int(min(150, max(6, H / (n + 1) / 2 - 3)))
+                x0, x1 = int(b[0] + W * 0.2), int(b[0] + W * 0.5); xm = (x0 + x1) // 2
+                box = (xm - 8, yc - half, xm + 9, yc + half + 1)
+                before = self.snap(box); bgc = before.getpixel((8, half))
+                self.click(m, *self.brushes[i]["pos"], 0.3)
+                for p in self.palette:                       # use a colour that contrasts with the background
+                    if sum(abs(p["rgb"][c] - bgc[c]) for c in range(3)) > 200: self.click(m, *p["pos"], 0.3); break
+                m.move(x0, yc); time.sleep(0.05); m.down(); time.sleep(0.05)
+                for q in range(1, 31): m.move(x0 + (x1 - x0) * q / 30, yc); time.sleep(0.006)
+                m.up(); time.sleep(0.3)
+                res[i] = self.measure(before, self.snap(box), half)
+                if g["undo"]:
+                    pyautogui.hotkey("command" if sys.platform == "darwin" else "ctrl", "z"); time.sleep(0.4)
+                    back = np.array(self.snap(box)).astype(int) - np.array(before).astype(int)
+                    if (np.abs(back).sum(2) > 60).mean() > 0.02: undo_failed = True
+        except KeyboardInterrupt: err = "Stopped."
+        except pyautogui.FailSafeException: err = "Stopped (failsafe corner)."
+        except Exception as ex: err = f"Error: {ex}"
+        self.drawing = False; self.after(0, self.calib_done, start, res, undo_failed, err)
+
+    def calib_done(self, start, res, undo_failed, err):
+        if self.mini: self.mini.destroy(); self.mini = None
+        self.deiconify()
+        for i in range(start, len(self.brushes)):
+            w = res.get(i)
+            if w: self.brushes[i]["px"] = w
+            elif err: self.brushes[i]["px"] = self.brushes[i]["px"] or 4 * (i + 1)
+            else:
+                px = simpledialog.askinteger("Brush size", f"Couldn't measure brush {i+1} automatically (a colour that differs from the background must be selected).\nEnter its width in pixels:", initialvalue=self.brushes[i]["px"] or 4 * (i + 1), minvalue=1, maxvalue=300, parent=self)
+                self.brushes[i]["px"] = px or 4 * (i + 1)
+        self.refresh(); self.sched_prev()
+        sizes = ", ".join(f"{b['px']}px" for b in self.brushes)
+        self.say((err + " " if err else "") + f"Brush sizes: {sizes}." + (" Couldn't undo the test lines - clear your canvas." if undo_failed else ""))
 
     def sel_palette(self):
         def done(box, grab, k):
@@ -329,7 +457,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         return self.brushes[names.index(n)] if n in names else None
 
     def step_px(self):
-        b = self.cur_brush(); return b["px"] if b else max(1, int(self.v["step"].get()))
+        b = self.cur_brush(); return max(1, b["px"]) if b else max(1, int(self.v["step"].get()))
 
     def eff_mode(self):
         m = self.v["mode"].get(); return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
@@ -435,25 +563,60 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.NEAREST)
         self.tkp = ImageTk.PhotoImage(im); self.prev.config(image=self.tkp, text="")
         plan = self.make_plan(self.idx, {k: v.get() for k, v in self.v.items()}, mode)
-        n = sum(len(r) for _, r in plan); pause, dur = self.timing(); est = n * (4 * pause + dur + 0.01)
+        n = sum(len(r) for _, r in plan); pause, dur = self.timing(); est = n * (2 * pause + dur + 0.03)
         self.say(f"{mode} | {n} strokes | brush/step {step}px | est. time at current speed ~{int(est//60)}m {int(est%60)}s")
 
     # ---------- drawing ----------
+    def click(self, m, x, y, wait=0.15):
+        m.move(x, y); time.sleep(0.06); m.down(); time.sleep(0.06); m.up(); time.sleep(wait)
+
+    def stroke(self, m, xa, ya, xb, yb, g, dur):
+        hold = g["hold"] / 1000.0; n = max(1, int(g["dragpts"]))
+        m.move(xa, ya); time.sleep(0.003)
+        m.down(g["button"]); time.sleep(hold)
+        if (xa, ya) == (xb, yb):
+            if g["nudge"]: m.move(xa + 1, ya); time.sleep(0.003); m.move(xa, ya); time.sleep(0.003)
+        else:
+            for i in range(1, n + 1):
+                m.move(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n); time.sleep(max(dur / n, 0.002))
+        m.up(g["button"])
+
+    def glide(self, m, xa, ya, xb, yb, steps=30):
+        for i in range(1, steps + 1): m.move(xa + (xb - xa) * i / steps, ya + (yb - ya) * i / steps); time.sleep(0.01)
+
     def trace(self):
         if not self.canvas_box: return messagebox.showinfo("Canvas", "Select the canvas first.")
-        b = self.canvas_box; self.iconify()
+        b = self.canvas_box; g = {k: v.get() for k, v in self.v.items()}; self.iconify()
         def go():
-            time.sleep(2.5)
             try:
-                pyautogui.PAUSE = 0.01; pyautogui.moveTo(b[0], b[1])
-                for p in ((b[2], b[1]), (b[2], b[3]), (b[0], b[3]), (b[0], b[1])): pyautogui.moveTo(*p, duration=0.4)
+                time.sleep(2.5); m = Mouse(g["input"].startswith("Windows")); m.move(b[0], b[1])
+                pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3]), (b[0], b[1])]
+                for p, q in zip(pts, pts[1:]): self.glide(m, *p, *q)
             except Exception: pass
             self.after(0, self.deiconify)
         threading.Thread(target=go, daemon=True).start()
 
+    def test_stroke(self):
+        if not self.canvas_box: return messagebox.showinfo("Canvas", "Select the canvas first.")
+        g = {k: v.get() for k, v in self.v.items()}; brush = self.cur_brush(); b = self.canvas_box
+        messagebox.showinfo("Test line", "Click OK, then switch to your drawing app.\nIn 3 seconds I'll draw one line and one dot across the middle of your canvas.")
+        self.iconify()
+        def go():
+            msg = "Test finished: did a line and a dot appear? If not, set Mouse input to PyAutoGUI, or run as administrator."
+            try:
+                time.sleep(3); m = Mouse(g["input"].startswith("Windows"))
+                if brush: self.click(m, *brush["pos"], g["swdelay"])
+                if self.palette: self.click(m, *self.palette[0]["pos"], g["swdelay"])
+                cy, w = (b[1] + b[3]) // 2, b[2] - b[0]
+                self.stroke(m, b[0] + w * 0.2, cy, b[0] + w * 0.8, cy, g, 0.5)
+                self.stroke(m, b[0] + w * 0.5, cy + 50, b[0] + w * 0.5, cy + 50, g, 0)
+            except Exception as ex: msg = f"Test error: {ex}"
+            self.after(0, self.deiconify); self.after(0, self.say, msg)
+        threading.Thread(target=go, daemon=True).start()
+
     def open_mini(self):
         m = self.mini = tk.Toplevel(self); m.title("Auto Drawer"); m.attributes("-topmost", True); m.configure(bg=CARD); m.resizable(False, False)
-        W, H = m.winfo_screenwidth(), m.winfo_screenheight(); m.geometry(f"310x215+{W-330}+{H-300}")
+        x, y = self.mini_pos(310, 215); m.geometry(f"310x215+{x}+{y}")
         m.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "stop", True))
         self.mt = tk.StringVar(value="Starting...")
         ttk.Label(m, textvariable=self.mt, wraplength=290).pack(padx=10, pady=(10, 4), anchor="w")
@@ -485,6 +648,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         threading.Thread(target=self.run, args=(plan, step, g, brush, mode), daemon=True).start()
 
     def gate(self):
+        if tuple(pyautogui.position()) == (0, 0): raise pyautogui.FailSafeException()
         if self.stop: raise KeyboardInterrupt
         if self.paused:
             p0 = time.time(); self.ui("Paused - F8 or the Resume button to continue")
@@ -493,31 +657,24 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             if self.stop: raise KeyboardInterrupt
 
     def run(self, plan, step, g, brush, mode):
-        msg = "Done!"
+        msg, m = "Done!", None
         try:
-            bx, by = self.canvas_box[:2]; btn = g["button"]; hold = g["hold"] / 1000.0; n = max(1, int(g["dragpts"]))
+            m = Mouse(g["input"].startswith("Windows")); bx, by = self.canvas_box[:2]
             for s in range(g["countdown"], 0, -1):
                 if self.stop: raise KeyboardInterrupt
                 self.ui(f"Starting in {s}s - click on your drawing app now!"); time.sleep(1)
             weight = lambda r: abs(r[1][0] - r[0][0]) + abs(r[1][1] - r[0][1]) + 1
             total = max(1, sum(weight(r) for _, runs in plan for r in runs)); done, last = 0, 0
             self.t0 = time.time()
-            if brush: pyautogui.click(*brush["pos"]); time.sleep(g["swdelay"])
+            if brush: self.click(m, *brush["pos"], g["swdelay"])
             for ci, runs in plan:
                 self.gate()
-                if mode == "Palette colours": pyautogui.click(*self.palette[ci]["pos"]); time.sleep(g["swdelay"])
+                if mode == "Palette colours": self.click(m, *self.palette[ci]["pos"], g["swdelay"])
                 for a, b in runs:
-                    self.gate()
-                    pause, dur = self.timing(); pyautogui.PAUSE = pause
-                    xa, ya = bx + a[0] * step + step // 2, by + a[1] * step + step // 2
-                    xb, yb = bx + b[0] * step + step // 2, by + b[1] * step + step // 2
-                    pyautogui.moveTo(xa, ya)
-                    pyautogui.mouseDown(button=btn)
-                    if hold: time.sleep(hold)
-                    if a != b:
-                        for i in range(1, n + 1):
-                            pyautogui.moveTo(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n, duration=dur / n)
-                    pyautogui.mouseUp(button=btn)
+                    self.gate(); pause, dur = self.timing()
+                    self.stroke(m, bx + a[0] * step + step // 2, by + a[1] * step + step // 2,
+                                bx + b[0] * step + step // 2, by + b[1] * step + step // 2, g, dur)
+                    if pause: time.sleep(pause)
                     done += weight((a, b))
                     if time.time() - last > 0.25:
                         last = time.time(); el = last - self.t0; rem = el / done * (total - done) if done else 0
@@ -526,9 +683,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
         except Exception as ex: msg = f"Error: {ex}"
         finally:
-            try: pyautogui.mouseUp(button=g["button"])
+            try: m and m.up(g["button"])
             except Exception: pass
-            pyautogui.PAUSE = 0.1; self.drawing = False; self.after(0, self.finish, msg, g["beep"])
+            self.drawing = False; self.after(0, self.finish, msg, g["beep"])
 
     def finish(self, msg, beep):
         if self.mini: self.mini.destroy(); self.mini = None
