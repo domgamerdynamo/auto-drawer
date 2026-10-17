@@ -1,13 +1,13 @@
 """
-Auto Drawer Pro - draws a reference image into any on-screen canvas with your mouse.
-Canvas selection is required; colours and brush are optional and independent.
-Emergency stop: slam the mouse into a screen corner, or press ESC.
+Auto Drawer Pro v2 - draws a reference image onto any on-screen canvas with your mouse.
+Hotkeys while drawing:  F8 pause/resume | F9 slower | F10 faster | ESC stop
+Emergency stop: slam the mouse into the TOP-LEFT screen corner.
 """
-import sys, json, threading, time, os
+import sys, os, json, threading, time, queue
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox, simpledialog
 import numpy as np
-from PIL import Image, ImageTk, ImageGrab, ImageFilter, ImageEnhance
+from PIL import Image, ImageTk, ImageGrab, ImageFilter, ImageEnhance, ImageOps
 import pyautogui
 
 if sys.platform == "win32":
@@ -28,57 +28,106 @@ except Exception:
 pyautogui.FAILSAFE = True
 pyautogui.MINIMUM_DURATION = 0
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
+CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
+PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
+                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush"]
 
 
 class App((TkinterDnD.Tk if DND else tk.Tk)):
     def __init__(self):
         super().__init__()
-        self.title("Auto Drawer Pro"); self.geometry("1080x760"); self.configure(bg=BG)
-        self.img = self.idx = self.canvas_box = None
+        self.title("Auto Drawer Pro"); self.geometry("1320x780"); self.minsize(1100, 700); self.configure(bg=BG)
+        self.img = self.idx = self.canvas_box = self.mini = self.pid = None
         self.palette, self.brushes = [], []
-        self.stop = self.drawing = False
-        V = tk.StringVar, tk.IntVar, tk.DoubleVar, tk.BooleanVar
-        self.v = {"mode": V[0](value="Auto"), "fit": V[0](value="Fit (keep ratio)"), "step": V[1](value=6),
-                  "thr": V[1](value=110), "contrast": V[2](value=1.0), "delay": V[2](value=0.002),
-                  "countdown": V[1](value=4), "dither": V[3](value=False), "skipwhite": V[3](value=True),
-                  "brush": V[0](value="")}
-        self.style()
-        self.build()
+        self.stop = self.paused = self.drawing = False
+        self.spd, self.t0 = 70.0, 0.0
+        self.hk = queue.Queue()
+        S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
+        self.v = dict(
+            speed=D(value=70), dragpts=I(value=0), hold=I(value=0), swdelay=D(value=0.15), button=S(value="left"),
+            countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
+            offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
+            invert=B(value=False), bright=D(value=1.0), contrast=D(value=1.0), sat=D(value=1.0), blur=D(value=0),
+            thr=D(value=110), dither=B(value=False), skipwhite=B(value=True), despeckle=D(value=0),
+            scan=S(value="Horizontal"), corder=S(value="Palette order"), step=I(value=6), brush=S(value=""),
+            minimize=B(value=True), ontop=B(value=False), beep=B(value=True))
+        self.defaults = {k: v.get() for k, v in self.v.items()}
+        self.style(); self.build()
         if DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", lambda e: self.load_image(self.tk.splitlist(e.data)[0]))
         if keyboard:
-            keyboard.Listener(on_press=lambda k: setattr(self, "stop", True) if k == keyboard.Key.esc else None).start()
-        self.refresh()
+            keyboard.Listener(on_press=self.on_key).start()
+        try: self.apply_cfg(json.load(open(CFG)))
+        except Exception: pass
+        self.spd = float(self.v["speed"].get())
+        self.v["speed"].trace_add("write", lambda *a: setattr(self, "spd", float(self.v["speed"].get())))
+        self.v["ontop"].trace_add("write", lambda *a: self.attributes("-topmost", bool(self.v["ontop"].get())))
+        for k in PREVIEW_KEYS: self.v[k].trace_add("write", self.sched_prev)
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.refresh(); self.after(100, self.poll)
 
-    # ---------- UI ----------
+    # ---------- hotkeys ----------
+    def on_key(self, k):
+        if not self.drawing: return
+        if k == keyboard.Key.esc: self.stop = True
+        elif k == keyboard.Key.f8: self.paused = not self.paused
+        elif k == keyboard.Key.f9: self.hk.put(-10)
+        elif k == keyboard.Key.f10: self.hk.put(10)
+
+    def poll(self):
+        while not self.hk.empty():
+            self.v["speed"].set(max(1, min(100, self.v["speed"].get() + self.hk.get())))
+        self.after(100, self.poll)
+
+    # ---------- UI helpers ----------
     def style(self):
         s = ttk.Style(self); s.theme_use("clam")
         s.configure(".", background=CARD, foreground=FG, fieldbackground=BG, font=("Segoe UI", 10))
         s.configure("TFrame", background=CARD); s.configure("TLabel", background=CARD, foreground=FG)
         s.configure("TCheckbutton", background=CARD, foreground=FG)
-        s.configure("TButton", background="#3a3d4b", foreground=FG, padding=6, borderwidth=0)
+        s.configure("TButton", background="#3a3d4b", foreground=FG, padding=5, borderwidth=0)
         s.map("TButton", background=[("active", ACC)])
         s.configure("Go.TButton", background=ACC, font=("Segoe UI", 12, "bold"), padding=10)
         s.map("Go.TButton", background=[("active", "#6ba0ff")])
         s.configure("H.TLabel", font=("Segoe UI", 11, "bold"))
+        s.configure("TNotebook", background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background="#3a3d4b", foreground=FG, padding=(14, 6))
+        s.map("TNotebook.Tab", background=[("selected", ACC)])
         s.configure("TScale", background=CARD); s.configure("TSeparator", background=BG)
 
     def card(self, parent, title, tag):
-        f = ttk.Frame(parent, padding=8); f.pack(fill="x", pady=4)
+        f = ttk.Frame(parent, padding=8); f.pack(fill="x", pady=3)
         h = ttk.Frame(f); h.pack(fill="x")
         ttk.Label(h, text=title, style="H.TLabel").pack(side="left")
         st = ttk.Label(h, text=tag, foreground="#999"); st.pack(side="right")
         return f, st
 
+    def _row(self, p, label):
+        r = ttk.Frame(p); r.pack(fill="x", pady=2); ttk.Label(r, text=label, width=17).pack(side="left"); return r
+
+    def slider(self, p, label, key, lo, hi, fmt="{:.0f}"):
+        r = self._row(p, label); val = ttk.Label(r, width=7); val.pack(side="right")
+        ttk.Scale(r, from_=lo, to=hi, variable=self.v[key]).pack(side="left", fill="x", expand=True)
+        upd = lambda *a: val.config(text=fmt.format(self.v[key].get())); self.v[key].trace_add("write", upd); upd()
+
+    def combo(self, p, label, key, values):
+        ttk.Combobox(self._row(p, label), textvariable=self.v[key], state="readonly", values=values).pack(side="left", fill="x", expand=True)
+
+    def spin(self, p, label, key, lo, hi, inc=1):
+        ttk.Spinbox(self._row(p, label), from_=lo, to=hi, increment=inc, textvariable=self.v[key], width=8).pack(side="left")
+
+    def check(self, p, text, key): ttk.Checkbutton(p, text=text, variable=self.v[key]).pack(anchor="w", pady=1)
+
+    # ---------- layout ----------
     def build(self):
-        left = tk.Frame(self, bg=BG, width=380); left.pack(side="left", fill="y", padx=8, pady=4)
-        left.pack_propagate(False)
-        right = tk.Frame(self, bg=BG); right.pack(side="right", fill="both", expand=True, padx=8, pady=8)
+        left = tk.Frame(self, bg=BG, width=340); left.pack(side="left", fill="y", padx=(8, 4), pady=6); left.pack_propagate(False)
+        mid = tk.Frame(self, bg=BG, width=400); mid.pack(side="left", fill="y", padx=4, pady=6); mid.pack_propagate(False)
+        right = tk.Frame(self, bg=BG); right.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=6)
 
         f, self.st_img = self.card(left, "Reference image", "required")
-        self.drop = tk.Label(f, text="Drop image here or click to browse", bg=BG, fg="#aaa", height=3, relief="flat", cursor="hand2")
-        self.drop.pack(fill="x", pady=4); self.drop.bind("<Button-1>", lambda e: self.browse())
+        self.drop = tk.Label(f, text="Drop image here or click to browse", bg=BG, fg="#aaa", height=3, cursor="hand2")
+        self.drop.pack(fill="x", pady=3); self.drop.bind("<Button-1>", lambda e: self.browse())
 
         f, self.st_canvas = self.card(left, "1  Canvas area", "required")
         ttk.Button(f, text="Select canvas (drag a box)", command=self.sel_canvas).pack(fill="x")
@@ -86,62 +135,97 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
         f, self.st_col = self.card(left, "2  Colours", "optional")
         r = ttk.Frame(f); r.pack(fill="x")
-        ttk.Button(r, text="Select palette box (auto-find)", command=self.sel_palette).pack(side="left", expand=True, fill="x")
+        ttk.Button(r, text="Select palette box", command=self.sel_palette).pack(side="left", expand=True, fill="x")
         ttk.Button(r, text="Click swatches", command=self.click_swatches).pack(side="left", expand=True, fill="x", padx=(4, 0))
-        self.chips = tk.Frame(f, bg=CARD); self.chips.pack(fill="x", pady=4)
-        ttk.Button(f, text="Clear colours", command=lambda: (self.palette.clear(), self.refresh())).pack(anchor="e")
+        self.chips = tk.Frame(f, bg=CARD); self.chips.pack(fill="x", pady=3)
+        ttk.Button(f, text="Clear colours", command=lambda: (self.palette.clear(), self.refresh(), self.sched_prev())).pack(anchor="e")
 
         f, self.st_br = self.card(left, "3  Brush size", "optional")
         ttk.Button(f, text="Click brush-size buttons", command=self.click_brushes).pack(fill="x")
-        r = ttk.Frame(f); r.pack(fill="x", pady=3)
-        ttk.Label(r, text="Use:").pack(side="left")
-        self.cb = ttk.Combobox(r, textvariable=self.v["brush"], state="readonly", width=22); self.cb.pack(side="left", padx=4)
-        ttk.Button(r, text="Clear", command=lambda: (self.brushes.clear(), self.refresh()), width=6).pack(side="right")
-        r = ttk.Frame(f); r.pack(fill="x")
-        ttk.Label(r, text="Manual step px:").pack(side="left")
-        ttk.Spinbox(r, from_=1, to=60, textvariable=self.v["step"], width=5).pack(side="left", padx=4)
-
-        f, _ = self.card(left, "Options", "")
-        def row(lbl, w):
-            r = ttk.Frame(f); r.pack(fill="x", pady=1); ttk.Label(r, text=lbl, width=14).pack(side="left"); w.pack(side="left", fill="x", expand=True)
-        row("Mode", ttk.Combobox(f, textvariable=self.v["mode"], state="readonly", values=["Auto", "Palette colours", "Black & white", "Line art"]))
-        row("Fit", ttk.Combobox(f, textvariable=self.v["fit"], state="readonly", values=["Fit (keep ratio)", "Stretch to canvas"]))
-        row("Threshold", ttk.Scale(f, from_=5, to=250, variable=self.v["thr"], command=lambda e: None))
-        row("Contrast", ttk.Scale(f, from_=0.5, to=2.5, variable=self.v["contrast"]))
-        row("Delay (s)", ttk.Spinbox(f, from_=0, to=0.2, increment=0.001, textvariable=self.v["delay"], width=6))
-        row("Countdown (s)", ttk.Spinbox(f, from_=1, to=15, textvariable=self.v["countdown"], width=6))
-        ttk.Checkbutton(f, text="Dither colours", variable=self.v["dither"]).pack(anchor="w")
-        ttk.Checkbutton(f, text="Skip white (keep canvas background)", variable=self.v["skipwhite"]).pack(anchor="w")
+        r = ttk.Frame(f); r.pack(fill="x", pady=3); ttk.Label(r, text="Use:").pack(side="left")
+        self.cb = ttk.Combobox(r, textvariable=self.v["brush"], state="readonly", width=20); self.cb.pack(side="left", padx=4)
+        ttk.Button(r, text="Clear", width=6, command=lambda: (self.brushes.clear(), self.refresh())).pack(side="right")
+        self.spin(f, "Manual step px", "step", 1, 60)
 
         r = tk.Frame(left, bg=BG); r.pack(fill="x", pady=4)
         for t, c in (("Preview", self.preview), ("Trace outline", self.trace)):
             ttk.Button(r, text=t, command=c).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(r, text="Save", command=self.save_cfg, width=6).pack(side="left", padx=2)
-        ttk.Button(r, text="Load", command=self.load_cfg, width=6).pack(side="left", padx=2)
+        ttk.Button(r, text="Save", width=6, command=self.save_cfg).pack(side="left", padx=2)
+        ttk.Button(r, text="Load", width=6, command=self.load_cfg).pack(side="left", padx=2)
         ttk.Button(left, text="START DRAWING", style="Go.TButton", command=self.start).pack(fill="x", padx=2, pady=4)
-        self.status = tk.Label(left, text="Ready", bg=BG, fg="#aaa", wraplength=360, justify="left"); self.status.pack(anchor="w")
+        self.status = tk.Label(left, text="Ready", bg=BG, fg="#aaa", wraplength=320, justify="left"); self.status.pack(anchor="w")
+
+        nb = ttk.Notebook(mid); nb.pack(fill="both", expand=True)
+        tabs = {n: ttk.Frame(nb, padding=10) for n in ("Speed", "Image", "Drawing", "App")}
+        for n, t in tabs.items(): nb.add(t, text=n)
+
+        t = tabs["Speed"]
+        ttk.Label(t, text="Drawing speed", style="H.TLabel").pack(anchor="w")
+        self.slider(t, "Speed (1-100)", "speed", 1, 100)
+        r = ttk.Frame(t); r.pack(fill="x", pady=4)
+        for n, val in (("Slow", 20), ("Normal", 55), ("Fast", 85), ("Max", 100)):
+            ttk.Button(r, text=n, command=lambda x=val: self.v["speed"].set(x)).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Label(t, text="Speed can be changed LIVE while drawing\n(F9 slower / F10 faster, or the mini panel).", foreground="#999").pack(anchor="w", pady=(0, 8))
+        ttk.Separator(t).pack(fill="x", pady=4)
+        self.spin(t, "Smooth drag points", "dragpts", 0, 10)
+        self.spin(t, "Mouse-down hold ms", "hold", 0, 300, 5)
+        self.spin(t, "Colour switch delay", "swdelay", 0, 3, 0.05)
+        self.spin(t, "Start countdown (s)", "countdown", 1, 20)
+        self.combo(t, "Draw with button", "button", ["left", "right"])
+        ttk.Label(t, text="Tip: if your app skips or breaks strokes, lower the\nspeed or add smooth drag points.", foreground="#999").pack(anchor="w", pady=6)
+
+        t = tabs["Image"]
+        self.slider(t, "Image size %", "scale", 10, 300); self.slider(t, "Move left/right %", "offx", -100, 100)
+        self.slider(t, "Move up/down %", "offy", -100, 100); self.combo(t, "Rotate", "rot", ["0°", "90°", "180°", "270°"])
+        r = ttk.Frame(t); r.pack(fill="x")
+        for txt, k in (("Flip horizontal", "flipx"), ("Flip vertical", "flipy"), ("Invert", "invert")):
+            ttk.Checkbutton(r, text=txt, variable=self.v[k]).pack(side="left", padx=4)
+        ttk.Separator(t).pack(fill="x", pady=6)
+        self.slider(t, "Brightness", "bright", 0.3, 2.0, "{:.2f}"); self.slider(t, "Contrast", "contrast", 0.5, 2.5, "{:.2f}")
+        self.slider(t, "Colour boost", "sat", 0, 3, "{:.2f}"); self.slider(t, "Smooth / blur", "blur", 0, 5, "{:.1f}")
+        self.slider(t, "Threshold (B&W/lines)", "thr", 5, 250)
+
+        t = tabs["Drawing"]
+        self.combo(t, "Mode", "mode", ["Auto", "Palette colours", "Black & white", "Line art"])
+        self.combo(t, "Fit", "fit", ["Fit (keep ratio)", "Stretch to canvas"])
+        self.combo(t, "Stroke direction", "scan", ["Horizontal", "Vertical", "Serpentine"])
+        self.combo(t, "Colour order", "corder", ["Palette order", "Lightest first", "Darkest first", "Most pixels first", "Fewest pixels first"])
+        self.slider(t, "Remove specks (0-3)", "despeckle", 0, 3)
+        self.check(t, "Dither colours (smoother blends)", "dither")
+        self.check(t, "Skip white (keep canvas background)", "skipwhite")
+        ttk.Label(t, text="Tip: 'Most pixels first' paints big background\ncolours first; 'Serpentine' saves mouse travel.", foreground="#999").pack(anchor="w", pady=8)
+
+        t = tabs["App"]
+        self.check(t, "Hide this window while drawing", "minimize"); self.check(t, "Keep this window on top", "ontop")
+        self.check(t, "Beep when finished", "beep")
+        ttk.Button(t, text="Reset all settings", command=self.reset).pack(anchor="w", pady=8)
+        ttk.Label(t, text="Hotkeys while drawing:\nF8  pause / resume\nF9  slower     F10  faster\nESC  stop\nTop-left screen corner = emergency stop\n\nYour setup is saved automatically on exit.", foreground="#999").pack(anchor="w")
 
         self.prev = tk.Label(right, text="Preview", bg="#15161b", fg="#666"); self.prev.pack(fill="both", expand=True)
 
     def say(self, t): self.status.config(text=t); self.update_idletasks()
 
+    def reset(self):
+        for k, val in self.defaults.items(): self.v[k].set(val)
+        self.refresh()
+
     def refresh(self):
-        def mark(lbl, ok, opt=False):
-            lbl.config(text="✔ set" if ok else ("optional" if opt else "required"), foreground=OK if ok else "#999")
+        def mark(lbl, ok, opt=False): lbl.config(text="✔ set" if ok else ("optional" if opt else "required"), foreground=OK if ok else "#999")
         mark(self.st_img, self.img is not None); mark(self.st_canvas, self.canvas_box is not None)
         mark(self.st_col, bool(self.palette), True); mark(self.st_br, bool(self.brushes), True)
         b = self.canvas_box
         self.l_canvas.config(text=f"{b[2]-b[0]} x {b[3]-b[1]} px at ({b[0]}, {b[1]})" if b else "Not set")
         for w in self.chips.winfo_children(): w.destroy()
         for i, p in enumerate(self.palette):
-            l = tk.Label(self.chips, text="", bg="#%02x%02x%02x" % p["rgb"], width=3, height=1, cursor="X_cursor")
-            l.pack(side="left", padx=1, pady=1); l.bind("<Button-1>", lambda e, i=i: (self.palette.pop(i), self.refresh()))
-        names = [f"Brush {i+1}: {b['px']}px" for i, b in enumerate(self.brushes)]
-        self.cb["values"] = names
+            l = tk.Label(self.chips, bg="#%02x%02x%02x" % p["rgb"], width=3, cursor="X_cursor"); l.pack(side="left", padx=1, pady=1)
+            l.bind("<Button-1>", lambda e, i=i: (self.palette.pop(i), self.refresh(), self.sched_prev()))
+        names = self.brush_names(); self.cb["values"] = names
         if names and self.v["brush"].get() not in names: self.v["brush"].set(names[0])
         if not names: self.v["brush"].set("")
 
-    # ---------- reference image ----------
+    def brush_names(self): return [f"Brush {i+1}: {b['px']}px" for i, b in enumerate(self.brushes)]
+
+    # ---------- image ----------
     def browse(self):
         p = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp")])
         if p: self.load_image(p)
@@ -156,47 +240,38 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.withdraw(); self.update(); time.sleep(0.35)
         grab = ImageGrab.grab().convert("RGB")
         t = tk.Toplevel(self); t.attributes("-fullscreen", True, "-topmost", True); t.config(cursor="crosshair")
-        W, H = t.winfo_screenwidth(), t.winfo_screenheight()
-        k = grab.width / W
+        W, H = t.winfo_screenwidth(), t.winfo_screenheight(); k = grab.width / W
         c = tk.Canvas(t, width=W, height=H, highlightthickness=0); c.pack()
-        dim = ImageEnhance.Brightness(grab).enhance(0.45).resize((W, H))
-        c.dim = ImageTk.PhotoImage(dim); c.create_image(0, 0, anchor="nw", image=c.dim)
+        c.dim = ImageTk.PhotoImage(ImageEnhance.Brightness(grab).enhance(0.45).resize((W, H))); c.create_image(0, 0, anchor="nw", image=c.dim)
         c.create_rectangle(0, 0, 880, 36, fill="black"); c.create_text(10, 18, anchor="w", fill="yellow", font=("Arial", 14), text=hint)
         t.bind("<Escape>", lambda e: self.close(t)); t.focus_force()
-        return t, c, grab, k, (W, H)
+        return t, c, grab, k
 
-    def close(self, t):
-        t.destroy(); self.deiconify(); self.refresh()
+    def close(self, t): t.destroy(); self.deiconify(); self.refresh()
 
     def box_select(self, hint, done):
-        t, c, grab, k, (W, H) = self.overlay(hint)
-        s = {}
-        def down(e):
-            s["p"] = (e.x, e.y, e.x_root, e.y_root); s["r"] = c.create_rectangle(e.x, e.y, e.x, e.y, outline="#4f8cff", width=2)
+        t, c, grab, k = self.overlay(hint); s = {}
+        def down(e): s["p"] = (e.x, e.y, e.x_root, e.y_root); s["r"] = c.create_rectangle(e.x, e.y, e.x, e.y, outline="#4f8cff", width=2)
         def drag(e):
             x1, y1 = s["p"][:2]; c.coords(s["r"], x1, y1, e.x, e.y)
             bx = (min(x1, e.x), min(y1, e.y), max(x1, e.x), max(y1, e.y))
             if bx[2] - bx[0] > 2 and bx[3] - bx[1] > 2:
-                crop = grab.crop(tuple(int(v * k) for v in bx)).resize((bx[2] - bx[0], bx[3] - bx[1]))
-                c.bright = ImageTk.PhotoImage(crop)
+                c.bright = ImageTk.PhotoImage(grab.crop(tuple(int(v * k) for v in bx)).resize((bx[2] - bx[0], bx[3] - bx[1])))
                 if "b" in s: c.delete(s["b"])
                 s["b"] = c.create_image(bx[0], bx[1], anchor="nw", image=c.bright); c.tag_raise(s["r"])
         def up(e):
-            x1, y1, xr, yr = s["p"]
-            box = (min(xr, e.x_root), min(yr, e.y_root), max(xr, e.x_root), max(yr, e.y_root))
+            xr, yr = s["p"][2:]; box = (min(xr, e.x_root), min(yr, e.y_root), max(xr, e.x_root), max(yr, e.y_root))
             self.close(t)
             if box[2] - box[0] > 5 and box[3] - box[1] > 5: done(box, grab, k)
         c.bind("<ButtonPress-1>", down); c.bind("<B1-Motion>", drag); c.bind("<ButtonRelease-1>", up)
 
     def click_select(self, hint, done):
-        t, c, grab, k, _ = self.overlay(hint + "  (right-click / Esc = finish)")
-        pts = []
+        t, c, grab, k = self.overlay(hint + "  (right-click / Esc = finish)"); pts = []
         def click(e):
             pts.append((e.x_root, e.y_root, grab.getpixel((int(e.x * k), int(e.y * k)))))
             c.create_oval(e.x - 7, e.y - 7, e.x + 7, e.y + 7, outline="red", width=2)
             c.create_text(e.x + 14, e.y - 12, text=str(len(pts)), fill="red", font=("Arial", 14, "bold"))
-        c.bind("<Button-1>", click)
-        c.bind("<Button-3>", lambda e: (self.close(t), done(pts)))
+        c.bind("<Button-1>", click); c.bind("<Button-3>", lambda e: (self.close(t), done(pts)))
         t.bind("<Escape>", lambda e: (self.close(t), done(pts)))
 
     def sel_canvas(self):
@@ -219,8 +294,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         def done(box, grab, k):
             found = self.detect(box, grab, k)
             if not found: return messagebox.showinfo("Colours", "No swatches found. Try a tighter box or use 'Click swatches'.")
-            self.palette += found; self.refresh(); self.preview()
-            self.say(f"Found {len(found)} colours. Click a colour chip to remove it.")
+            self.palette += found; self.refresh(); self.preview(); self.say(f"Found {len(found)} colours. Click a chip to remove it.")
         self.box_select("Drag a box around your colour palette.  Esc = cancel", done)
 
     def detect(self, box, grab, k):
@@ -239,7 +313,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                             seen[ny, nx] = True; st.append((ny, nx))
                 n = len(cells)
                 if n < 12 or n > 0.25 * H * W: continue
-                ys, xs = np.array(cells).T; bh, bw = ys.ptp() + 1, xs.ptp() + 1
+                ys, xs = np.array(cells).T; bh, bw = np.ptp(ys) + 1, np.ptp(xs) + 1
                 if bw < 3 or bh < 3 or n / (bh * bw) < 0.6: continue
                 rgb = tuple(int(v) for v in a[ys, xs].mean(0))
                 if any(sum(abs(np.array(rgb) - np.array(o[2]))) < 14 for o in out): continue
@@ -249,30 +323,40 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         out.sort(key=lambda o: (int(o[0] / rh), o[1]))
         return [{"pos": ((x1 + o[1] * s + s / 2) / k, (y1 + o[0] * s + s / 2) / k), "rgb": o[2]} for o in out]
 
-    # ---------- processing ----------
+    # ---------- image -> stroke grid ----------
+    def cur_brush(self):
+        n = self.v["brush"].get(); names = self.brush_names()
+        return self.brushes[names.index(n)] if n in names else None
+
     def step_px(self):
-        n = self.v["brush"].get()
-        if n and self.brushes: return self.brushes[[f"Brush {i+1}: {b['px']}px" for i, b in enumerate(self.brushes)].index(n)]["px"]
-        return max(1, self.v["step"].get())
+        b = self.cur_brush(); return b["px"] if b else max(1, int(self.v["step"].get()))
 
     def eff_mode(self):
-        m = self.v["mode"].get()
-        return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
+        m = self.v["mode"].get(); return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
 
     def build_grid(self):
         if self.img is None or self.canvas_box is None: raise ValueError("Add a reference image and select the canvas first.")
+        g = {k: v.get() for k, v in self.v.items()}
         step, mode, b = self.step_px(), self.eff_mode(), self.canvas_box
         cols, rows = (b[2] - b[0]) // step, (b[3] - b[1]) // step
         if cols < 2 or rows < 2: raise ValueError("Canvas too small for this brush size.")
         im = self.img
-        if self.v["fit"].get().startswith("Fit"):
-            sc = min(cols / im.width, rows / im.height); w, h = max(1, int(im.width * sc)), max(1, int(im.height * sc))
-        else: w, h = cols, rows
+        if g["rot"] != "0°": im = im.rotate(-int(g["rot"][:-1]), expand=True)
+        if g["flipx"]: im = ImageOps.mirror(im)
+        if g["flipy"]: im = ImageOps.flip(im)
+        sz = g["scale"] / 100.0
+        if g["fit"].startswith("Fit"): sc = min(cols / im.width, rows / im.height) * sz; w, h = im.width * sc, im.height * sc
+        else: w, h = cols * sz, rows * sz
+        w, h = max(1, min(int(w), 1500)), max(1, min(int(h), 1500))
         big = 3 if mode == "Line art" else 1
         bg = Image.new("RGBA", (w * big, h * big), (255, 255, 255, 0)); bg.alpha_composite(im.resize((w * big, h * big), Image.LANCZOS))
         alpha = np.array(bg)[:, :, 3] > 40
-        arr = np.clip((np.array(bg.convert("RGB")).astype(float) - 128) * self.v["contrast"].get() + 128, 0, 255)
-        gray, thr = arr.mean(2), self.v["thr"].get()
+        rgb = bg.convert("RGB")
+        if g["blur"] > 0: rgb = rgb.filter(ImageFilter.GaussianBlur(g["blur"] * big))
+        rgb = ImageEnhance.Color(ImageEnhance.Brightness(rgb).enhance(g["bright"])).enhance(g["sat"])
+        arr = np.clip((np.array(rgb).astype(float) - 128) * g["contrast"] + 128, 0, 255)
+        if g["invert"]: arr = 255 - arr
+        gray, thr = arr.mean(2), g["thr"]
         if mode == "Line art":
             e = np.array(Image.fromarray(gray.astype("uint8")).filter(ImageFilter.FIND_EDGES))
             e = np.array(Image.fromarray(e).resize((w, h), Image.BOX)).astype(float)
@@ -282,7 +366,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         else:
             if not self.palette: raise ValueError("Add colours first, or switch mode to Black & white.")
             pal = np.array([p["rgb"] for p in self.palette], float)
-            if self.v["dither"].get():
+            if g["dither"]:
                 a = arr.copy(); out = np.zeros((h, w), int)
                 for y in range(h):
                     for x in range(w):
@@ -294,22 +378,65 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                             if x + 1 < w: a[y+1, x+1] += err / 16
             else: out = ((arr[:, :, None, :] - pal[None, None]) ** 2).sum(3).argmin(2)
             skip = ~alpha
-            if self.v["skipwhite"].get(): skip |= gray > 240
+            if g["skipwhite"]: skip |= gray > 240
             out = np.where(skip, -1, out)
-        full = -np.ones((rows, cols), int); oy, ox = (rows - out.shape[0]) // 2, (cols - out.shape[1]) // 2
-        full[oy:oy + out.shape[0], ox:ox + out.shape[1]] = out[:rows, :cols]
+        lvl = int(g["despeckle"])
+        if lvl > 0:
+            p = np.pad(out, 1, constant_values=-2)
+            same = sum((p[1+dy:1+dy+h, 1+dx:1+dx+w] == out).astype(int) for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+            out = np.where((out >= 0) & (same < lvl), -1, out)
+        full = -np.ones((rows, cols), int)
+        oy, ox = (rows - h) // 2 + int(g["offy"] / 100 * rows), (cols - w) // 2 + int(g["offx"] / 100 * cols)
+        sy, sx, dy, dx = max(0, -oy), max(0, -ox), max(0, oy), max(0, ox)
+        hh, ww = min(h - sy, rows - dy), min(w - sx, cols - dx)
+        if hh > 0 and ww > 0: full[dy:dy+hh, dx:dx+ww] = out[sy:sy+hh, sx:sx+ww]
         return full, step
+
+    def make_plan(self, idx, g, mode):
+        pal = mode == "Palette colours"
+        cis = list(range(len(self.palette))) if pal else [0]
+        counts = {c: int((idx == c).sum()) for c in cis}; cis = [c for c in cis if counts[c] > 0]
+        lum = lambda c: sum(self.palette[c]["rgb"]) if pal else 0
+        o = g["corder"]
+        if o == "Lightest first": cis.sort(key=lum, reverse=True)
+        elif o == "Darkest first": cis.sort(key=lum)
+        elif o == "Most pixels first": cis.sort(key=lambda c: -counts[c])
+        elif o == "Fewest pixels first": cis.sort(key=lambda c: counts[c])
+        vert, serp = g["scan"] == "Vertical", g["scan"] == "Serpentine"
+        mat = idx.T if vert else idx; plan = []
+        for c in cis:
+            runs = []
+            for r in range(mat.shape[0]):
+                d = np.diff(np.concatenate(([0], (mat[r] == c).astype(np.int8), [0])))
+                rs = list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1) - 1))
+                if serp and r % 2: rs = [(e, s) for s, e in reversed(rs)]
+                for s, e in rs:
+                    s, e = int(s), int(e)
+                    runs.append(((r, s), (r, e)) if vert else ((s, r), (e, r)))
+            plan.append((c, runs))
+        return plan
+
+    def timing(self):
+        s = self.spd / 100.0
+        return 0.08 * (1 - s) ** 2, 0.3 * (1 - s) ** 3   # pause between mouse actions, drag duration
+
+    def sched_prev(self, *a):
+        if self.pid: self.after_cancel(self.pid)
+        self.pid = self.after(300, lambda: self.img is not None and self.canvas_box and self.preview())
 
     def preview(self):
         try: self.idx, step = self.build_grid()
         except ValueError as e: return self.say(str(e))
-        cols = [p["rgb"] for p in self.palette] if self.eff_mode() == "Palette colours" else [(0, 0, 0)]
+        mode = self.eff_mode()
+        cols = [p["rgb"] for p in self.palette] if mode == "Palette colours" else [(0, 0, 0)]
         px = np.full((*self.idx.shape, 3), 255, np.uint8)
         for i, c in enumerate(cols): px[self.idx == i] = c
-        im = Image.fromarray(px); sc = min(660 / im.width, 680 / im.height)
+        im = Image.fromarray(px); sc = min(560 / im.width, 700 / im.height)
         im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.NEAREST)
         self.tkp = ImageTk.PhotoImage(im); self.prev.config(image=self.tkp, text="")
-        self.say(f"{self.eff_mode()} | grid {self.idx.shape[1]}x{self.idx.shape[0]} | ~{int((self.idx >= 0).sum())} dabs | step {step}px")
+        plan = self.make_plan(self.idx, {k: v.get() for k, v in self.v.items()}, mode)
+        n = sum(len(r) for _, r in plan); pause, dur = self.timing(); est = n * (4 * pause + dur + 0.01)
+        self.say(f"{mode} | {n} strokes | brush/step {step}px | est. time at current speed ~{int(est//60)}m {int(est%60)}s")
 
     # ---------- drawing ----------
     def trace(self):
@@ -324,61 +451,118 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             self.after(0, self.deiconify)
         threading.Thread(target=go, daemon=True).start()
 
+    def open_mini(self):
+        m = self.mini = tk.Toplevel(self); m.title("Auto Drawer"); m.attributes("-topmost", True); m.configure(bg=CARD); m.resizable(False, False)
+        W, H = m.winfo_screenwidth(), m.winfo_screenheight(); m.geometry(f"310x215+{W-330}+{H-300}")
+        m.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "stop", True))
+        self.mt = tk.StringVar(value="Starting...")
+        ttk.Label(m, textvariable=self.mt, wraplength=290).pack(padx=10, pady=(10, 4), anchor="w")
+        self.pb = ttk.Progressbar(m, maximum=100); self.pb.pack(fill="x", padx=10)
+        r = ttk.Frame(m); r.pack(fill="x", padx=10, pady=8)
+        self.pbtn = ttk.Button(r, text="Pause", command=lambda: setattr(self, "paused", not self.paused)); self.pbtn.pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(r, text="Stop", command=lambda: setattr(self, "stop", True)).pack(side="left", expand=True, fill="x", padx=2)
+        r = ttk.Frame(m); r.pack(fill="x", padx=10); ttk.Label(r, text="Speed").pack(side="left")
+        ttk.Scale(r, from_=1, to=100, variable=self.v["speed"]).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Label(m, text="F8 pause · F9 slower · F10 faster · ESC stop", foreground="#999").pack(pady=6)
+
+    def set_progress(self, frac, text):
+        if not self.mini: return
+        if frac is not None: self.pb["value"] = frac * 100
+        self.mt.set(text); self.pbtn.config(text="Resume" if self.paused else "Pause")
+
+    def ui(self, text, frac=None): self.after(0, self.set_progress, frac, text)
+
     def start(self):
         if self.drawing: return
         try: self.idx, step = self.build_grid()
         except ValueError as e: return messagebox.showinfo("Setup", str(e))
-        self.stop, self.drawing = False, True
-        threading.Thread(target=self.run, args=(self.idx, step), daemon=True).start()
+        g = {k: v.get() for k, v in self.v.items()}; mode = self.eff_mode()
+        plan = self.make_plan(self.idx, g, mode)
+        if not plan: return messagebox.showinfo("Nothing to draw", "Nothing to draw with these settings.")
+        brush = self.cur_brush(); self.stop = self.paused = False; self.drawing = True
+        self.open_mini()
+        if g["minimize"]: self.withdraw()
+        threading.Thread(target=self.run, args=(plan, step, g, brush, mode), daemon=True).start()
 
-    def run(self, idx, step):
+    def gate(self):
+        if self.stop: raise KeyboardInterrupt
+        if self.paused:
+            p0 = time.time(); self.ui("Paused - F8 or the Resume button to continue")
+            while self.paused and not self.stop: time.sleep(0.1)
+            self.t0 += time.time() - p0
+            if self.stop: raise KeyboardInterrupt
+
+    def run(self, plan, step, g, brush, mode):
+        msg = "Done!"
         try:
-            for s in range(self.v["countdown"].get(), 0, -1):
-                self.after(0, self.say, f"Starting in {s}s - switch to your drawing app! (ESC / corner = stop)"); time.sleep(1)
-            self.after(0, self.iconify)
-            pyautogui.PAUSE = max(0, self.v["delay"].get()); x0, y0 = self.canvas_box[:2]
-            n = self.v["brush"].get()
-            if n and self.brushes: pyautogui.click(*self.brushes[[f"Brush {i+1}: {b['px']}px" for i, b in enumerate(self.brushes)].index(n)]["pos"])
-            pal = self.eff_mode() == "Palette colours"
-            for ci in (range(len(self.palette)) if pal else [0]):
-                if not (idx == ci).any(): continue
-                if pal: pyautogui.click(*self.palette[ci]["pos"])
-                for r in range(idx.shape[0]):
-                    row, c, y = idx[r], 0, y0 + r * step + step // 2
-                    while c < len(row):
-                        if row[c] != ci: c += 1; continue
-                        e = c
-                        while e + 1 < len(row) and row[e + 1] == ci: e += 1
-                        if self.stop: raise KeyboardInterrupt
-                        pyautogui.moveTo(x0 + c * step + step // 2, y)
-                        if e == c: pyautogui.click()
-                        else: pyautogui.mouseDown(); pyautogui.moveTo(x0 + e * step + step // 2, y); pyautogui.mouseUp()
-                        c = e + 1
-            msg = "Done!"
+            bx, by = self.canvas_box[:2]; btn = g["button"]; hold = g["hold"] / 1000.0; n = max(1, int(g["dragpts"]))
+            for s in range(g["countdown"], 0, -1):
+                if self.stop: raise KeyboardInterrupt
+                self.ui(f"Starting in {s}s - click on your drawing app now!"); time.sleep(1)
+            weight = lambda r: abs(r[1][0] - r[0][0]) + abs(r[1][1] - r[0][1]) + 1
+            total = max(1, sum(weight(r) for _, runs in plan for r in runs)); done, last = 0, 0
+            self.t0 = time.time()
+            if brush: pyautogui.click(*brush["pos"]); time.sleep(g["swdelay"])
+            for ci, runs in plan:
+                self.gate()
+                if mode == "Palette colours": pyautogui.click(*self.palette[ci]["pos"]); time.sleep(g["swdelay"])
+                for a, b in runs:
+                    self.gate()
+                    pause, dur = self.timing(); pyautogui.PAUSE = pause
+                    xa, ya = bx + a[0] * step + step // 2, by + a[1] * step + step // 2
+                    xb, yb = bx + b[0] * step + step // 2, by + b[1] * step + step // 2
+                    pyautogui.moveTo(xa, ya)
+                    pyautogui.mouseDown(button=btn)
+                    if hold: time.sleep(hold)
+                    if a != b:
+                        for i in range(1, n + 1):
+                            pyautogui.moveTo(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n, duration=dur / n)
+                    pyautogui.mouseUp(button=btn)
+                    done += weight((a, b))
+                    if time.time() - last > 0.25:
+                        last = time.time(); el = last - self.t0; rem = el / done * (total - done) if done else 0
+                        self.ui(f"{done*100//total}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", done / total)
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
         except Exception as ex: msg = f"Error: {ex}"
         finally:
-            try: pyautogui.mouseUp()
+            try: pyautogui.mouseUp(button=g["button"])
             except Exception: pass
-            self.drawing = False; self.after(0, self.deiconify); self.after(0, self.say, msg)
+            pyautogui.PAUSE = 0.1; self.drawing = False; self.after(0, self.finish, msg, g["beep"])
+
+    def finish(self, msg, beep):
+        if self.mini: self.mini.destroy(); self.mini = None
+        self.deiconify(); self.say(msg)
+        if beep and msg == "Done!":
+            try:
+                import winsound; winsound.MessageBeep()
+            except Exception: self.bell()
 
     # ---------- setup files ----------
-    def save_cfg(self):
-        p = filedialog.asksaveasfilename(defaultextension=".json")
-        if p: json.dump({"canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes,
-                         "settings": {k: v.get() for k, v in self.v.items()}}, open(p, "w"))
+    def cfg_dict(self):
+        return {"canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "settings": {k: v.get() for k, v in self.v.items()}}
 
-    def load_cfg(self):
-        p = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not p: return
-        d = json.load(open(p))
+    def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
         for k, val in d.get("settings", {}).items():
-            if k in self.v: self.v[k].set(val)
-        self.refresh()
+            if k in self.v:
+                try: self.v[k].set(val)
+                except Exception: pass
+
+    def save_cfg(self):
+        p = filedialog.asksaveasfilename(defaultextension=".json")
+        if p: json.dump(self.cfg_dict(), open(p, "w"))
+
+    def load_cfg(self):
+        p = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if p: self.apply_cfg(json.load(open(p))); self.refresh(); self.sched_prev()
+
+    def quit_app(self):
+        try: json.dump(self.cfg_dict(), open(CFG, "w"))
+        except Exception: pass
+        self.stop = True; self.destroy()
 
 
 if __name__ == "__main__":
