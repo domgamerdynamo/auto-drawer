@@ -1,0 +1,13 @@
+GET YOUR SINGLE .EXE (no Python needed, ~5 minutes, free)
+
+1. Go to github.com and sign up / log in (free).
+2. Click the "+" (top right) -> "New repository". Name it "auto-drawer", keep it Public, click "Create repository".
+3. Click "uploading an existing file". Unzip this folder first, then drag EVERYTHING
+   inside it into the browser (including the ".github" folder). Click "Commit changes".
+4. Click the "Actions" tab. If asked, click the green "I understand my workflows" button.
+   Wait ~3 minutes for the yellow dot to turn into a green tick.
+5. Go back to the "Code" tab -> on the right, click "Releases" -> "Auto Drawer (latest)".
+6. Download AutoDrawer.exe. Double-click it. Done. Share that same link with anyone.
+
+If ".github" doesn't upload: click "Add file" -> "Create new file", type
+.github/workflows/build.yml as the name, and paste the contents of that file in.
