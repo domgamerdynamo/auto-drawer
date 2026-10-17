@@ -1,0 +1,23 @@
+name: Build AutoDrawer.exe
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow numpy pyautogui tkinterdnd2 pynput pyinstaller
+      - run: pyinstaller --noconfirm --onefile --windowed --name AutoDrawer --icon AutoDrawer.ico --collect-all tkinterdnd2 auto_drawer_pro.py
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Auto Drawer (latest)
+          body: Download AutoDrawer.exe below and double-click it. No install needed.
+          files: dist/AutoDrawer.exe
