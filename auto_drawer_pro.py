@@ -81,10 +81,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.undo_pos = self.last_before = self.last_plan = self.park_pt = None; self.last_mode = "Black & white"
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
-            speed=D(value=70), dragpts=I(value=3), hold=I(value=10), swdelay=D(value=0.15), button=S(value="left"),
+            speed=D(value=70), dragpts=I(value=3), hold=I(value=20), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
-            maxstep=I(value=8), overlap=D(value=10), repair=I(value=2), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"),
+            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), overlap=D(value=10), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
@@ -248,6 +248,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Separator(t).pack(fill="x", pady=4)
         self.spin(t, "Smooth drag points", "dragpts", 0, 10)
         self.spin(t, "Max move step px", "maxstep", 0, 60)
+        self.spin(t, "End-of-stroke settle ms", "settle", 0, 150)
+        self.spin(t, "Pen-up wait ms", "lift", 0, 200)
+        ttk.Button(t, text="Auto-tune speed (test on canvas)", command=self.autotune).pack(fill="x", pady=4)
         self.spin(t, "Mouse-down hold ms", "hold", 0, 300, 5)
         self.spin(t, "Colour switch delay", "swdelay", 0, 3, 0.05)
         self.spin(t, "Start countdown (s)", "countdown", 1, 20)
@@ -394,19 +397,25 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 self.refresh()
         self.click_select("Click each brush-size button (smallest to largest).", done)
 
-    def mini_pos(self, w, h):
-        """Pick a screen corner for the mini panel that does not cover the canvas, swatches or brush buttons."""
+    def mini_place(self, w, h):
+        """Find the screen spot where the panel covers the least of the canvas / swatches / brush buttons."""
         W, H = self.winfo_screenwidth(), self.winfo_screenheight(); b = self.canvas_box or (0, 0, 0, 0)
-        pts = [p["pos"] for p in self.palette] + [q["pos"] for q in self.brushes]; best = None
-        for x, y in ((W - w - 20, H - h - 80), (20, H - h - 80), (W - w - 20, 40), (20, 40)):
-            ov = max(0, min(x + w, b[2]) - max(x, b[0])) * max(0, min(y + h, b[3]) - max(y, b[1]))
-            ov += 10 ** 9 * sum(1 for px, py in pts if x - 15 <= px <= x + w + 15 and y - 15 <= py <= y + h + 15)
-            if best is None or ov < best[0]: best = (ov, x, y)
-        return best[1], best[2]
+        pts = [p["pos"] for p in self.palette] + [q["pos"] for q in self.brushes] + ([self.undo_pos] if self.undo_pos else [])
+        best = None
+        for x in range(0, max(1, W - w), 40):
+            for y in range(0, max(1, H - h - 40), 40):
+                ov = max(0, min(x + w, b[2]) - max(x, b[0])) * max(0, min(y + h, b[3]) - max(y, b[1]))
+                ov += 10 ** 9 * sum(1 for px, py in pts if x - 15 <= px <= x + w + 15 and y - 15 <= py <= y + h + 15)
+                key = (ov, min(x, W - w - x) + min(y, H - h - y))
+                if best is None or key < best[0]: best = (key, x, y)
+        return best[1], best[2], best[0][0] > 0
 
     def snap(self, box):
-        try: return ImageGrab.grab(bbox=box, all_screens=True).convert("RGB")
-        except TypeError: return ImageGrab.grab(bbox=box).convert("RGB")
+        k = self.gscale(); b2 = tuple(int(round(v * k)) for v in box) if abs(k - 1) > 0.02 else tuple(box)
+        try: im = ImageGrab.grab(bbox=b2, all_screens=True).convert("RGB")
+        except TypeError: im = ImageGrab.grab(bbox=b2).convert("RGB")
+        w, h = box[2] - box[0], box[3] - box[1]
+        return im.resize((w, h), Image.BOX) if im.size != (w, h) else im
 
     @staticmethod
     def measure(before, after, c):
@@ -477,6 +486,75 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         except pyautogui.FailSafeException: err = "Stopped (failsafe corner)."
         except Exception as ex: self.log(traceback.format_exc()); err = f"Error: {ex}"
         self.drawing = False; self.after(0, self.calib_done, start, res, undo_failed, err)
+
+    @staticmethod
+    def dash_score(before, after, n, dash, gap, margin, pad=6):
+        d = np.abs(np.array(before).astype(int) - np.array(after).astype(int)).sum(2) > 60
+        col = d.any(axis=0); ok = tot = 0
+        for k in range(n):
+            s = pad + k * (dash + gap)
+            ok += int(col[s:s + dash].sum()); tot += dash                        # dash fully drawn
+            gs, ge = s + dash + margin, s + dash + gap - margin
+            if k < n - 1 and ge > gs: ok += int((~col[gs:ge]).sum()); tot += ge - gs   # gap kept clean (no connecting line)
+        return ok / max(1, tot)
+
+    def autotune(self):
+        if self.drawing: return
+        if not self.canvas_box: return messagebox.showinfo("Canvas", "Select the canvas first.")
+        if not messagebox.askyesno("Auto-tune", "I'll draw a few short test lines on your canvas at different speeds, check which speeds draw COMPLETELY, then undo them.\n\nMake sure your drawing app is ready and a visible colour/brush is selected. Continue?"): return
+        g = {k: v.get() for k, v in self.v.items()}
+        self.stop = self.paused = False; self.drawing = True; self.open_mini(); self.withdraw()
+        threading.Thread(target=self._tune, args=(g,), daemon=True).start()
+
+    PROFILES = [(100, 4, 3, 3), (85, 10, 8, 8), (70, 15, 12, 15), (55, 20, 20, 25), (40, 30, 30, 40), (25, 45, 45, 60), (10, 70, 70, 90)]
+
+    def _tune(self, g):
+        res, err, uf = [], "", False
+        try:
+            m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box; W, H = b[2] - b[0], b[3] - b[1]
+            n_p = len(self.PROFILES); brush = self.cur_brush()
+            for s in range(3, 0, -1):
+                if self.stop: raise KeyboardInterrupt
+                self.ui(f"Speed test in {s}s - keep your drawing app visible!"); time.sleep(1)
+            if brush: self.click(m, *brush["pos"], 0.3)
+            bw = min(60, max(int(g["step"]), 8)); dash = 40; gap = max(70, bw + 30); margin = bw // 2 + 4
+            n = max(2, min(5, int((W * 0.8 + gap) // (dash + gap)))); x0 = int(b[0] + W * 0.1); total = n * dash + (n - 1) * gap; picked = False
+            for j, (sp, hold, settle, lift) in enumerate(self.PROFILES):
+                self.gate(); self.ui(f"Testing timing profile {j+1}/{n_p} (speed {sp})...", j / n_p)
+                yc = int(b[1] + H * (j + 1) / (n_p + 1)); band = (x0 - 6, yc - 6, x0 + total + 7, yc + 7)
+                before = self.snap(band)
+                if not picked:
+                    picked = True; bgc = before.getpixel((8, 6))
+                    for p in self.palette:
+                        if sum(abs(p["rgb"][c] - bgc[c]) for c in range(3)) > 200: self.click(m, *p["pos"], 0.3); break
+                g2 = dict(g, hold=hold, settle=settle, lift=lift); self.spd = float(sp); pause, interval = self.timing()
+                for k in range(n):
+                    self.gate(); xa = x0 + k * (dash + gap); self.stroke(m, xa, yc, xa + dash, yc, g2, interval)
+                time.sleep(pause + 0.3)
+                res.append((j, self.dash_score(before, self.snap(band), n, dash, gap, margin)))
+                if g["undo"]:
+                    self.do_undo(m); back = np.array(self.snap(band)).astype(int) - np.array(before).astype(int)
+                    uf |= bool((np.abs(back).sum(2) > 60).mean() > 0.02)
+        except KeyboardInterrupt: err = "Stopped."
+        except pyautogui.FailSafeException: err = "Stopped (failsafe corner)."
+        except Exception as ex: self.log(traceback.format_exc()); err = f"Error: {ex}"
+        self.drawing = False; self.after(0, self.tune_done, res, uf, err)
+
+    def tune_done(self, res, uf, err):
+        if self.mini: self.mini.destroy(); self.mini = None
+        self.deiconify()
+        if err or not res: return self.say(err or "Speed test didn't run.")
+        ok = [f >= 0.97 for _, f in res]; best = None
+        for i in range(len(res)):                      # fastest profile that, together with the next slower one, draws perfectly
+            if ok[i] and (i + 1 >= len(res) or ok[i + 1]): best = i; break
+        table = ", ".join(f"speed {self.PROFILES[j][0]}: {int(f * 100)}%" for j, f in res)
+        if best is None:
+            best = len(self.PROFILES) - 1
+            txt = f"No profile drew the test dashes perfectly ({table}). I picked the slowest, safest timing. Check the canvas box, selected colour/brush, and that nothing covers the canvas."
+        else: txt = f"Test results: {table}. Applied the fastest reliable timing (speed {self.PROFILES[best][0]})."
+        sp, hold, settle, lift = self.PROFILES[best]
+        self.v["speed"].set(sp); self.v["hold"].set(hold); self.v["settle"].set(settle); self.v["lift"].set(lift)
+        self.say(txt + (" Couldn't undo the test lines - clear your canvas." if uf else ""))
 
     def calib_done(self, start, res, undo_failed, err):
         if self.mini: self.mini.destroy(); self.mini = None
@@ -712,16 +790,17 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         m.move(x, y); time.sleep(0.06); m.down(); time.sleep(0.06); m.up(); time.sleep(wait)
 
     def stroke(self, m, xa, ya, xb, yb, g, interval):
-        hold = g["hold"] / 1000.0; dist = math.hypot(xb - xa, yb - ya)
+        hold = g["hold"] / 1000.0; settle = g["settle"] / 1000.0; dist = math.hypot(xb - xa, yb - ya)
         n = max(1, int(g["dragpts"]), math.ceil(dist / g["maxstep"]) if g["maxstep"] > 0 else 1)
         m.move(xa, ya); time.sleep(0.004)
         m.down(g["button"]); time.sleep(hold)
         if dist == 0:
-            if g["nudge"]: m.move(xa + 1, ya); time.sleep(0.003); m.move(xa, ya); time.sleep(0.003)
+            if g["nudge"]: m.move(xa + 1, ya); time.sleep(0.003); m.move(xa, ya)
         else:
             for i in range(1, n + 1):
                 m.move(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n); time.sleep(interval)
-        time.sleep(0.003); m.up(g["button"])
+            m.move(xb, yb)          # repeat the final point so an app can't drop the tail of the stroke
+        time.sleep(settle); m.up(g["button"]); time.sleep(g["lift"] / 1000.0)
 
     def glide(self, m, xa, ya, xb, yb, steps=30):
         for i in range(1, steps + 1): m.move(xa + (xb - xa) * i / steps, ya + (yb - ya) * i / steps); time.sleep(0.01)
@@ -758,17 +837,32 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     def open_mini(self):
         m = self.mini = tk.Toplevel(self); m.title("Auto Drawer"); m.attributes("-topmost", True); m.configure(bg=CARD); m.resizable(False, False)
-        x, y = self.mini_pos(310, 215); m.geometry(f"310x215+{x}+{y}"); self.park_pt = (x + 155, y + 100)
+        w, h = 290, 175; x, y, blocked = self.mini_place(w, h); self.panel_blocked = blocked
+        m.geometry(f"{w}x{h}+{x}+{y}"); self.park_pt = (x + w // 2, y + h // 2)
         m.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "stop", True))
         self.mt = tk.StringVar(value="Starting...")
-        ttk.Label(m, textvariable=self.mt, wraplength=290).pack(padx=10, pady=(10, 4), anchor="w")
+        ttk.Label(m, textvariable=self.mt, wraplength=270).pack(padx=10, pady=(8, 4), anchor="w")
         self.pb = ttk.Progressbar(m, maximum=100); self.pb.pack(fill="x", padx=10)
-        r = ttk.Frame(m); r.pack(fill="x", padx=10, pady=8)
+        r = ttk.Frame(m); r.pack(fill="x", padx=10, pady=6)
         self.pbtn = ttk.Button(r, text="Pause", command=lambda: setattr(self, "paused", not self.paused)); self.pbtn.pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(r, text="Stop", command=lambda: setattr(self, "stop", True)).pack(side="left", expand=True, fill="x", padx=2)
         r = ttk.Frame(m); r.pack(fill="x", padx=10); ttk.Label(r, text="Speed").pack(side="left")
         ttk.Scale(r, from_=1, to=100, variable=self.v["speed"]).pack(side="left", fill="x", expand=True, padx=6)
-        k = self.keys; ttk.Label(m, text=f"{k['pause'].upper()} pause · {k['slower'].upper()} slower · {k['faster'].upper()} faster · {k['stop'].upper()} stop", foreground="#999").pack(pady=6)
+        k = self.keys
+        ttk.Label(m, text=("Click-through (it overlaps your canvas) - use hotkeys:\n" if blocked else "") + f"{k['pause'].upper()} pause · {k['slower'].upper()} slower · {k['faster'].upper()} faster · {k['stop'].upper()} stop", foreground="#999", wraplength=270).pack(pady=4)
+        m.update_idletasks()
+        if sys.platform == "win32":
+            try:
+                if blocked: m.attributes("-alpha", 0.85)
+                u = ctypes.windll.user32; hwnd = u.GetParent(m.winfo_id()) or m.winfo_id(); st = u.GetWindowLongW(hwnd, -20)
+                st |= 0x08000000 | 0x80                    # never take focus away from your drawing app
+                if blocked: st |= 0x80000 | 0x20           # click-through so strokes pass over the panel
+                u.SetWindowLongW(hwnd, -20, st)
+            except Exception: pass
+
+    def panel_vis(self, show):
+        if self.mini and getattr(self, "panel_blocked", False):
+            self.after(0, lambda: self.mini and (self.mini.deiconify() if show else self.mini.withdraw()))
 
     def set_progress(self, frac, text):
         if not self.mini: return
@@ -804,6 +898,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 self.ui("Detecting your brush width with a test line...")
                 m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box
                 px, uf = self.test_line(m, g, (b[1] + b[3]) // 2, int(min(150, max(6, (b[3] - b[1]) / 4))), None)
+                if px and not (1 <= px <= min(b[2] - b[0], b[3] - b[1]) / 3): px = None
                 note = (f"Detected brush width: {px}px. " if px else "Couldn't detect the brush width, using the manual value. ") + ("Couldn't undo the test line. " if uf else "")
         except KeyboardInterrupt: self.drawing = False; return self.after(0, self.finish, "Stopped.", False)
         except pyautogui.FailSafeException: self.drawing = False; return self.after(0, self.finish, "Stopped (failsafe corner).", False)
@@ -897,17 +992,31 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             passes = max(1, int(g["repair"])) if repair_only else int(g["repair"])
             if repair_only and not pal and before is None: msg = "Repair needs Palette colours mode, or a drawing run first in this session."; passes = 0
             finest = (self.active_brushes() or [None])[-1]; pal_rgb = [p["rgb"] for p in self.palette] if pal else None
-            for ps in range(passes):
-                self.gate(); self.ui(f"Checking the drawing (pass {ps+1}/{passes})...", 1.0)
+
+            def look():
+                self.panel_vis(False); time.sleep(0.25 if getattr(self, "panel_blocked", False) else 0.05)
+                o = self.observe(rows, cols, s0); self.panel_vis(True); return o
+
+            final, prev = None, None
+            for ps in (range(passes + 1) if passes else []):
+                self.gate(); self.ui(f"Checking the canvas ({ps+1}/{passes+1})...", 1.0)
                 self.park(m); time.sleep(0.3)
-                obs = self.observe(rows, cols, s0)
+                obs = look()
                 if obs is None: msg = "Done (couldn't read the canvas to check it)."; break
-                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"]); n = int(miss.sum())
-                self.log(f"check {ps+1}: {n} of {want} cells missing")
-                if not repair_only and ps == 0 and n / want > 0.7: msg = "Done (the canvas check didn't match, so repair was skipped)."; break
-                if n <= max(2, 0.002 * want): break
-                self.ui(f"Repairing {n} missing spots (pass {ps+1}/{passes})...", 1.0)
+                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"]); n = int(miss.sum()); final = n
+                self.log(f"check {ps+1}: {n} of {want} spots missing (speed {int(self.spd)}, hold {g['hold']}, settle {g['settle']}, step {g['maxstep']})")
+                if not repair_only and ps == 0 and n / want > 0.7: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
+                if n <= max(2, 0.002 * want) or ps == passes: break
+                if (prev is not None and n > 0.6 * prev) or n / want > 0.25:      # not converging -> slow down, be more careful
+                    g = dict(g); g["hold"] = min(150, g["hold"] + 10); g["settle"] = min(150, g["settle"] + 10); g["lift"] = min(200, g["lift"] + 15); g["maxstep"] = max(3, (g["maxstep"] or 8) // 2)
+                    self.spd = max(5.0, self.spd * 0.6); self.after(0, self.v["speed"].set, self.spd)
+                    self.ui(f"Gaps remain - slowing down to speed {int(self.spd)} and repairing {n} spots...", 1.0)
+                else: self.ui(f"Repairing {n} missing spots (pass {ps+1}/{passes})...", 1.0)
+                prev = n
                 draw([self.fine_layer(np.where(miss, idx, -1), s0, g, finest, mode)], "Repair", False)
+            if final is not None:
+                msg = f"Done! {100 * (1 - final / want):.1f}% of the image matches ({final} spots still missing)." if final else "Done! Checked the canvas: everything matches."
+                if final > 0.02 * want: msg += " Gaps remain: try Auto-tune speed (Speed tab) or lower the speed."
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
         except Exception as ex: self.log(traceback.format_exc()); msg = f"Error: {ex}"
@@ -927,14 +1036,16 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     # ---------- setup files ----------
     def cfg_dict(self):
-        return {"canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
+        return {"ver": 5, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
 
     def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
         self.undo_pos = tuple(d["undo_pos"]) if d.get("undo_pos") else None
+        old = d.get("ver", 0) < 5
         for k, val in d.get("settings", {}).items():
+            if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift"): continue
             if k in self.v:
                 try: self.v[k].set(val)
                 except Exception: pass
