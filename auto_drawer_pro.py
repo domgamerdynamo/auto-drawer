@@ -3,7 +3,7 @@ Auto Drawer Pro v2 - draws a reference image onto any on-screen canvas with your
 Hotkeys while drawing:  F8 pause/resume | F9 slower | F10 faster | ESC stop
 Emergency stop: slam the mouse into the TOP-LEFT screen corner.
 """
-import sys, os, json, threading, time, queue, math, traceback
+import sys, os, json, threading, time, queue, math, traceback, random
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
@@ -65,9 +65,11 @@ class Mouse:
         else: pyautogui.mouseUp(button=b)
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
-PRESETS = {"Fast": dict(speed=90, hold=10, settle=8, lift=12, maxstep=10, dragpts=2, repair=2, swdelay=0.1),
-           "Balanced (recommended)": dict(speed=70, hold=20, settle=20, lift=25, maxstep=8, dragpts=3, repair=4, swdelay=0.15),
-           "Careful (most accurate)": dict(speed=40, hold=35, settle=35, lift=45, maxstep=5, dragpts=3, repair=6, swdelay=0.3)}
+GUARDS = ["Off", "Every 6th stroke", "Every stroke"]
+PRESETS = {"Fast": dict(speed=90, hold=10, settle=8, lift=12, maxstep=10, dragpts=2, repair=3, swdelay=0.1, guard=GUARDS[0], checkdelay=40, retries=1, jitter=10, gap=0, rate=0, mvint=0, layerdelay=100),
+           "Balanced (recommended)": dict(speed=70, hold=20, settle=20, lift=25, maxstep=8, dragpts=3, repair=6, swdelay=0.15, guard=GUARDS[1], checkdelay=60, retries=2, jitter=15, gap=0, rate=0, mvint=0, layerdelay=150),
+           "Careful (most accurate)": dict(speed=40, hold=35, settle=35, lift=45, maxstep=5, dragpts=3, repair=8, swdelay=0.3, guard=GUARDS[1], checkdelay=70, retries=3, jitter=15, gap=0, rate=0, mvint=0, layerdelay=250),
+           "Roblox / laggy game": dict(speed=55, hold=60, settle=60, lift=80, maxstep=6, dragpts=3, repair=10, swdelay=0.35, guard=GUARDS[1], checkdelay=90, retries=2, jitter=25, gap=0, rate=0, mvint=0, layerdelay=300)}
 ORDERS = ["Layers (big brush → small brush)", "One colour at a time", "One row at a time (all colours per row)"]
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
                 "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "order", "labmatch", "overlap", "margin"]
@@ -82,13 +84,13 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.stop = self.paused = self.drawing = False
         self.spd, self.t0 = 70.0, 0.0
         self.hk = queue.Queue(); self.rebind = None; self.keys = {}; self.keybtns = {}
-        self.undo_pos = self.last_before = self.last_plan = self.park_pt = self.cur_cap = None; self.last_mode = "Black & white"
+        self.undo_pos = self.last_before = self.last_plan = self.park_pt = self.cur_cap = None; self.profiles = {}; self.slow = 1.0; self.last_mode = "Black & white"
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
             speed=D(value=70), dragpts=I(value=3), hold=I(value=20), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
-            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), margin=I(value=1), fixwrong=B(value=False), verify=B(value=True), caps=S(value="Auto-detect"), preset=S(value="Balanced (recommended)"), overlap=D(value=0), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
+            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), margin=I(value=1), fixwrong=B(value=False), verify=B(value=True), caps=S(value="Auto-detect"), guard=S(value=GUARDS[1]), checkdelay=I(value=60), retries=I(value=2), jitter=D(value=15), gap=I(value=0), mvint=D(value=0), rate=I(value=0), layerdelay=I(value=150), preset=S(value="Balanced (recommended)"), overlap=D(value=0), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
@@ -239,12 +241,15 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.status = tk.Label(left, text="Ready", bg=BG, fg="#aaa", wraplength=320, justify="left"); self.status.pack(anchor="w")
 
         nb = ttk.Notebook(mid); nb.pack(fill="both", expand=True)
-        tabs = {n: ttk.Frame(nb, padding=10) for n in ("Speed", "Image", "Drawing", "App")}
+        tabs = {n: ttk.Frame(nb, padding=10) for n in ("Speed", "Timing", "Image", "Drawing", "App")}
         for n, t in tabs.items(): nb.add(t, text=n)
 
         t = tabs["Speed"]
-        r = self._row(t, "Preset"); pc = ttk.Combobox(r, textvariable=self.v["preset"], state="readonly", values=list(PRESETS)); pc.pack(side="left", fill="x", expand=True)
-        pc.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+        r = self._row(t, "Preset"); self.pc = ttk.Combobox(r, textvariable=self.v["preset"], state="readonly", values=self.preset_names()); self.pc.pack(side="left", fill="x", expand=True)
+        self.pc.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+        r = ttk.Frame(t); r.pack(fill="x", pady=2)
+        ttk.Button(r, text="Save current as preset...", command=self.save_preset).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(r, text="Delete preset", command=self.del_preset).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Label(t, text="Drawing speed", style="H.TLabel").pack(anchor="w")
         self.slider(t, "Speed (1-100)", "speed", 1, 100)
         r = ttk.Frame(t); r.pack(fill="x", pady=4)
@@ -252,6 +257,16 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             ttk.Button(r, text=n, command=lambda x=val: self.v["speed"].set(x)).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Label(t, text="Speed can be changed LIVE while drawing\n(F9 slower / F10 faster, or the mini panel).", foreground="#999").pack(anchor="w", pady=(0, 8))
         ttk.Separator(t).pack(fill="x", pady=4)
+        ttk.Label(t, text="Lag handling (Roblox / laggy games)", style="H.TLabel").pack(anchor="w")
+        self.combo(t, "Lag guard", "guard", GUARDS)
+        self.spin(t, "Check delay ms", "checkdelay", 0, 500, 10)
+        self.spin(t, "Retries per stroke", "retries", 0, 5)
+        self.slider(t, "Timing jitter %", "jitter", 0, 50)
+        self.spin(t, "Extra delay / stroke ms", "gap", 0, 500, 5)
+        self.spin(t, "Max strokes / sec (0=off)", "rate", 0, 200, 5)
+        self.spin(t, "Move interval ms (0=auto)", "mvint", 0, 50, 0.5)
+        ttk.Label(t, text="Lag guard checks that strokes really appeared and redraws them,\nand slows down by itself while the game is lagging.", foreground="#999").pack(anchor="w", pady=4)
+        t = tabs["Timing"]
         self.spin(t, "Smooth drag points", "dragpts", 0, 10)
         self.spin(t, "Max move step px", "maxstep", 0, 60)
         self.spin(t, "End-of-stroke settle ms", "settle", 0, 150)
@@ -259,11 +274,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Button(t, text="Auto-tune speed (test on canvas)", command=self.autotune).pack(fill="x", pady=4)
         self.spin(t, "Mouse-down hold ms", "hold", 0, 300, 5)
         self.spin(t, "Colour switch delay", "swdelay", 0, 3, 0.05)
+        self.spin(t, "Layer switch delay ms", "layerdelay", 0, 3000, 50)
         self.spin(t, "Start countdown (s)", "countdown", 1, 20)
         self.combo(t, "Draw with button", "button", ["left", "right"])
         self.combo(t, "Mouse input", "input", ["Windows SendInput (best)", "PyAutoGUI (fallback)"])
         self.check(t, "Nudge mouse on single dots", "nudge")
-        ttk.Label(t, text="Tip: if your app skips or breaks strokes, lower the\nspeed or add smooth drag points.", foreground="#999").pack(anchor="w", pady=6)
+        ttk.Label(t, text="Roblox tips: use Windowed / F11 fullscreen, lower graphics quality,\nclose other programs, and try the 'Roblox / laggy game' preset.", foreground="#999").pack(anchor="w", pady=6)
 
         t = tabs["Image"]
         self.slider(t, "Image size %", "scale", 10, 300); self.slider(t, "Move left/right %", "offx", -100, 100)
@@ -317,8 +333,24 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     def say(self, t): self.status.config(text=t); self.update_idletasks()
 
+    TIMING_KEYS = ("speed", "hold", "settle", "lift", "maxstep", "dragpts", "repair", "swdelay", "guard", "checkdelay", "retries", "jitter", "gap", "rate", "mvint", "layerdelay")
+
+    def preset_names(self): return list(PRESETS) + sorted(self.profiles)
+
+    def save_preset(self):
+        n = simpledialog.askstring("Save preset", "Name for this speed/timing preset:", parent=self)
+        if not n or not n.strip(): return
+        n = n.strip(); self.profiles[n] = {k: self.v[k].get() for k in self.TIMING_KEYS}
+        self.pc["values"] = self.preset_names(); self.v["preset"].set(n); self.say(f"Saved preset '{n}'.")
+
+    def del_preset(self):
+        n = self.v["preset"].get()
+        if n in self.profiles:
+            del self.profiles[n]; self.pc["values"] = self.preset_names(); self.v["preset"].set("Balanced (recommended)"); self.say(f"Deleted preset '{n}'.")
+        else: self.say("Only presets you saved yourself can be deleted.")
+
     def apply_preset(self):
-        for k, val in PRESETS.get(self.v["preset"].get(), {}).items(): self.v[k].set(val)
+        for k, val in (self.profiles.get(self.v["preset"].get()) or PRESETS.get(self.v["preset"].get(), {})).items(): self.v[k].set(val)
         self.say("Preset applied: " + self.v["preset"].get())
 
     def reset(self):
@@ -535,7 +567,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.stop = self.paused = False; self.drawing = True; self.open_mini(); self.withdraw()
         threading.Thread(target=self._tune, args=(g,), daemon=True).start()
 
-    PROFILES = [(100, 4, 3, 3), (85, 10, 8, 8), (70, 15, 12, 15), (55, 20, 20, 25), (40, 30, 30, 40), (25, 45, 45, 60), (10, 70, 70, 90)]
+    PROFILES = [(100, 4, 3, 3), (85, 10, 8, 8), (70, 15, 12, 15), (55, 20, 20, 25), (40, 30, 30, 40), (25, 45, 45, 60), (10, 70, 70, 90), (5, 110, 110, 140), (2, 170, 170, 220)]
 
     def _tune(self, g):
         res, err, uf = [], "", False
@@ -875,7 +907,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         m.move(x, y); time.sleep(0.06); m.down(); time.sleep(0.06); m.up(); time.sleep(wait)
 
     def stroke(self, m, xa, ya, xb, yb, g, interval):
-        hold = g["hold"] / 1000.0; settle = g["settle"] / 1000.0; dist = math.hypot(xb - xa, yb - ya)
+        k = getattr(self, "slow", 1.0); j = g.get("jitter", 0) / 100.0
+        rj = (lambda: 1.0 + random.uniform(-j, j)) if j else (lambda: 1.0)       # random timing wobble so strokes don't line up with the game's frames
+        hold, settle, lift = g["hold"] / 1000.0 * k * rj(), g["settle"] / 1000.0 * k * rj(), g["lift"] / 1000.0 * k * rj()
+        dist = math.hypot(xb - xa, yb - ya)
         n = max(1, int(g["dragpts"]), math.ceil(dist / g["maxstep"]) if g["maxstep"] > 0 else 1)
         m.move(xa, ya); time.sleep(0.004)
         m.down(g["button"]); time.sleep(hold)
@@ -885,7 +920,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             for i in range(1, n + 1):
                 m.move(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n); time.sleep(interval)
             m.move(xb, yb)          # repeat the final point so an app can't drop the tail of the stroke
-        time.sleep(settle); m.up(g["button"]); time.sleep(g["lift"] / 1000.0)
+        time.sleep(settle); m.up(g["button"]); time.sleep(lift)
 
     def glide(self, m, xa, ya, xb, yb, steps=30):
         for i in range(1, steps + 1): m.move(xa + (xb - xa) * i / steps, ya + (yb - ya) * i / steps); time.sleep(0.01)
@@ -1010,6 +1045,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             self.t0 += time.time() - p0
             if self.stop: raise KeyboardInterrupt
 
+    def painted(self, mx, my, want_rgb, pre=None, tol=35):
+        """Palette mode: the spot shows the wanted colour. Single-colour mode: the spot changed since `pre`."""
+        im = np.array(self.snap((int(mx) - 3, int(my) - 3, int(mx) + 4, int(my) + 4))).astype(float).reshape(-1, 3).mean(0)
+        if want_rgb is not None: return float(np.linalg.norm(self.to_lab(im) - self.to_lab(np.array(want_rgb, float)))) < tol
+        return pre is None or float(np.linalg.norm(self.to_lab(im) - self.to_lab(pre))) > 12
+
     def verify_colour(self, mx, my, rgb, tol=45):
         time.sleep(0.05)
         im = np.array(self.snap((int(mx) - 3, int(my) - 3, int(mx) + 4, int(my) + 4))).astype(float).reshape(-1, 3).mean(0)
@@ -1061,7 +1102,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             total = max(1.0, sum(weight(a, b, l["step"]) for l in plan for _, rs in l["colours"] for a, b in rs))
             st = {"done": 0.0, "last": 0.0}; self.t0 = time.time()
 
-            pal_all = [p["rgb"] for p in self.palette]; warns = {"brush": 0, "colour": 0}; expo = {}
+            pal_all = [p["rgb"] for p in self.palette]; warns = {"brush": 0, "colour": 0, "guard": 0}; expo = {}
+            gs = {"ema": 0.0, "since": 0, "consec": 0, "off": False, "n": 0, "peak": 1.0}; self.slow = 1.0
 
             def draw(layers, tag, track=True):
                 nonlocal g
@@ -1069,43 +1111,63 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                     p, br, w, cap = layer["step"], layer["brush"], layer["w"], layer["cap"]
                     if not layer["colours"]: continue
                     self.gate()
-                    if br: self.click(m, *br["pos"], g["swdelay"])
+                    if br: self.click(m, *br["pos"], g["swdelay"] * self.slow); time.sleep(g["layerdelay"] / 1000.0 * self.slow)
                     st["col"] = None; bdone = False
                     for ci, runs in layer["colours"]:
                         self.gate()
                         switched = pal and (st["col"] != ci or g["rebrush"])
-                        if switched: self.click(m, *self.palette[ci]["pos"], g["swdelay"])
-                        if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
+                        if switched: self.click(m, *self.palette[ci]["pos"], g["swdelay"] * self.slow)
+                        if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"] * self.slow)
                         st["col"] = ci; cdone = not (switched and g["verify"])
                         for a, b in runs:
-                            self.gate(); pause, interval = self.timing()
-                            x1, y1, x2, y2 = self.endpoints(a, b, p, w, cap, bx, by)
+                            t_s = time.time(); self.gate(); pause, interval = self.timing()
+                            if g["mvint"] > 0: interval = g["mvint"] / 1000.0
+                            x1, y1, x2, y2 = self.endpoints(a, b, p, w, cap, bx, by); mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                            first_in_block = not cdone; gs["n"] += 1
+                            due = (not gs["off"]) and (not first_in_block) and (g["guard"] == "Every stroke" or (g["guard"].startswith("Every 6th") and gs["n"] % 6 == 0))
+                            want_rgb = expo.get(ci, pal_all[ci]) if pal else None; pre_c = None
+                            if due and not pal: pre_c = np.array(self.snap((int(mx) - 3, int(my) - 3, int(mx) + 4, int(my) + 4))).astype(float).reshape(-1, 3).mean(0)
                             chk = br is not None and not bdone and g["verify"] and a[1] == b[1] and abs(b[0] - a[0]) >= 2
                             if chk:
-                                H = int(min(120, max(10, w * 1.2))); mx = int((x1 + x2) / 2); box = (mx - 3, int(y1) - H, mx + 4, int(y1) + H + 1); pre = self.snap(box)
+                                H = int(min(120, max(10, w * 1.2))); bx0 = int(mx); box = (bx0 - 3, int(y1) - H, bx0 + 4, int(y1) + H + 1); pre = self.snap(box)
                             self.stroke(m, x1, y1, x2, y2, g, interval)
                             if chk:      # is the brush really the size we think? (catches a missed brush-button click)
                                 bdone = True; t = self.measure(pre, self.snap(box), H)
                                 if t is not None and abs(t - w) > max(2, 0.3 * w):
                                     warns["brush"] += 1; self.log(f"brush check: expected {w:.0f}px, saw {t}px - re-selecting brush")
-                                    self.click(m, *br["pos"], g["swdelay"] + 0.3); self.stroke(m, x1, y1, x2, y2, g, interval)
+                                    self.click(m, *br["pos"], g["swdelay"] * self.slow + 0.3); self.stroke(m, x1, y1, x2, y2, g, interval)
                             if not cdone:      # did the colour click really register?
-                                cdone = True; mx, my = (x1 + x2) / 2, (y1 + y2) / 2; want_rgb = expo.get(ci, pal_all[ci])
-                                okc, got = self.verify_colour(mx, my, want_rgb)
+                                cdone = True; okc, got = self.verify_colour(mx, my, want_rgb)
                                 if not okc:
-                                    self.click(m, *self.palette[ci]["pos"], g["swdelay"] + 0.25); self.stroke(m, x1, y1, x2, y2, g, interval)
+                                    self.click(m, *self.palette[ci]["pos"], g["swdelay"] * self.slow + 0.25); self.stroke(m, x1, y1, x2, y2, g, interval)
                                     ok2, got2 = self.verify_colour(mx, my, want_rgb)
                                     if not ok2:
                                         if float(np.linalg.norm(self.to_lab(got) - self.to_lab(got2))) < 12: expo[ci] = tuple(got2)   # app's colour just differs from its swatch
                                         else:
                                             warns["colour"] += 1; g = dict(g); g["swdelay"] = min(1.0, g["swdelay"] + 0.15)
                                             self.log(f"colour check failed for colour {ci}: saw {got2.round()}")
-                            if pause: time.sleep(pause)
+                            if due:            # lag guard: did this stroke really appear? if not, draw it again
+                                time.sleep(g["checkdelay"] / 1000.0 * self.slow)
+                                first_failed = not self.painted(mx, my, want_rgb, pre_c); failed = first_failed; tries = 0
+                                while failed and tries < g["retries"]:
+                                    tries += 1
+                                    if tries >= 2 and pal: self.click(m, *self.palette[ci]["pos"], g["swdelay"] * self.slow + 0.1)
+                                    self.stroke(m, x1, y1, x2, y2, g, interval); time.sleep(g["checkdelay"] / 1000.0 * self.slow * (1 + tries))
+                                    failed = not self.painted(mx, my, want_rgb, pre_c)
+                                gs["consec"] = gs["consec"] + 1 if failed else 0
+                                if gs["consec"] >= 8: gs["off"] = True; warns["guard"] += 1; self.log("lag guard switched off: spots never verify (colour mismatch?)")
+                                gs["ema"] = 0.9 * gs["ema"] + 0.1 * (1.0 if first_failed else 0.0); gs["since"] += 1
+                                if gs["ema"] > 0.25 and self.slow < 3.0:
+                                    self.slow = min(3.0, self.slow * 1.2); gs["peak"] = max(gs["peak"], self.slow); gs["ema"] = 0.12; gs["since"] = 0
+                                    self.log(f"lag detected - slowing timing to x{self.slow:.2f}")
+                                elif gs["ema"] < 0.06 and self.slow > 1.0 and gs["since"] > 25: self.slow = max(1.0, self.slow / 1.15); gs["since"] = 0
+                            extra = max(pause + g["gap"] / 1000.0 * self.slow, (1.0 / g["rate"] if g["rate"] > 0 else 0.0) - (time.time() - t_s))
+                            if extra > 0: time.sleep(extra)
                             if track:
                                 st["done"] += weight(a, b, p)
                                 if time.time() - st["last"] > 0.25:
                                     st["last"] = time.time(); rem = (st["last"] - self.t0) / st["done"] * (total - st["done"])
-                                    self.ui(f"{tag} {li+1}/{len(layers)} | {int(st['done']*100//total)}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", st["done"] / total)
+                                    self.ui(f"{tag} {li+1}/{len(layers)} | {int(st['done']*100//total)}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}" + (f" | lag x{self.slow:.1f}" if self.slow > 1.05 else ""), st["done"] / total)
 
             if not repair_only: draw(plan, "Layer")
             passes = max(1, int(g["repair"])) if repair_only else int(g["repair"])
@@ -1128,7 +1190,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 miss = allm if (g["fixwrong"] or wrong > 0.03 * want) else gaps      # wrong colours are only redrawn when there are lots (a real failure, not edge noise)
                 n = int(miss.sum())
                 self.log(f"check {ps+1}: {final} of {want} spots off ({n} to repair) (speed {int(self.spd)}, hold {g['hold']}, settle {g['settle']}, step {g['maxstep']})")
-                if not repair_only and ps == 0 and final / want > 0.7: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
+                if not repair_only and ps == 0 and final / want > 0.97: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
                 if n <= max(2, 0.002 * want) or ps == passes: break
                 if (prev is not None and n > 0.6 * prev) or n / want > 0.25:      # not converging -> slow down, be more careful
                     g = dict(g); g["hold"] = min(150, g["hold"] + 10); g["settle"] = min(150, g["settle"] + 10); g["lift"] = min(200, g["lift"] + 15); g["maxstep"] = max(3, (g["maxstep"] or 8) // 2)
@@ -1141,6 +1203,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             if final is not None:
                 msg = f"Done! {100 * (1 - final / want):.1f}% of the image matches ({final} spots still blank or wrong)." if final else "Done! Checked the canvas: everything matches."
                 if final > 0.02 * want: msg += " Gaps remain: try Auto-tune speed (Speed tab) or lower the speed."
+            if gs["peak"] > 1.05 and msg.startswith("Done"): msg += f" (lag guard slowed the timing up to x{gs['peak']:.1f})"
+            if warns["guard"] and msg.startswith("Done"): msg += " (lag guard switched itself off: check that the swatch colours match what the game draws)"
             if (warns["brush"] or warns["colour"]) and msg.startswith("Done"): msg += f" (brush/colour selection needed {warns['brush'] + warns['colour']} retries - try the Careful preset)"
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
@@ -1148,7 +1212,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         finally:
             try: m and m.up(g["button"])
             except Exception: pass
-            self.drawing = False; self.after(0, self.finish, msg, g["beep"])
+            self.slow = 1.0; self.drawing = False; self.after(0, self.finish, msg, g["beep"])
 
     def finish(self, msg, beep):
         if self.mini: self.mini.destroy(); self.mini = None
@@ -1161,13 +1225,15 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     # ---------- setup files ----------
     def cfg_dict(self):
-        return {"ver": 7, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
+        return {"ver": 7, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "profiles": self.profiles, "settings": {k: v.get() for k, v in self.v.items()}}
 
     def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
         self.undo_pos = tuple(d["undo_pos"]) if d.get("undo_pos") else None
+        self.profiles = dict(d.get("profiles", {}))
+        if hasattr(self, "pc"): self.pc["values"] = self.preset_names()
         old = d.get("ver", 0) < 7
         for k, val in d.get("settings", {}).items():
             if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift", "margin", "overlap", "despeckle"): continue
