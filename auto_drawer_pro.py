@@ -65,6 +65,9 @@ class Mouse:
         else: pyautogui.mouseUp(button=b)
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
+PRESETS = {"Fast": dict(speed=90, hold=10, settle=8, lift=12, maxstep=10, dragpts=2, repair=2, swdelay=0.1),
+           "Balanced (recommended)": dict(speed=70, hold=20, settle=20, lift=25, maxstep=8, dragpts=3, repair=4, swdelay=0.15),
+           "Careful (most accurate)": dict(speed=40, hold=35, settle=35, lift=45, maxstep=5, dragpts=3, repair=6, swdelay=0.3)}
 ORDERS = ["Layers (big brush → small brush)", "One colour at a time", "One row at a time (all colours per row)"]
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
                 "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "order", "labmatch", "overlap", "margin"]
@@ -79,18 +82,18 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.stop = self.paused = self.drawing = False
         self.spd, self.t0 = 70.0, 0.0
         self.hk = queue.Queue(); self.rebind = None; self.keys = {}; self.keybtns = {}
-        self.undo_pos = self.last_before = self.last_plan = self.park_pt = None; self.last_mode = "Black & white"
+        self.undo_pos = self.last_before = self.last_plan = self.park_pt = self.cur_cap = None; self.last_mode = "Black & white"
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
             speed=D(value=70), dragpts=I(value=3), hold=I(value=20), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
-            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), margin=I(value=1), fixwrong=B(value=False), overlap=D(value=0), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
+            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), margin=I(value=1), fixwrong=B(value=False), verify=B(value=True), caps=S(value="Auto-detect"), preset=S(value="Balanced (recommended)"), overlap=D(value=0), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
             invert=B(value=False), bright=D(value=1.0), contrast=D(value=1.0), sat=D(value=1.0), blur=D(value=0),
-            thr=D(value=110), dither=B(value=False), skipwhite=B(value=True), despeckle=D(value=0),
+            thr=D(value=110), dither=B(value=False), skipwhite=B(value=True), despeckle=D(value=1),
             scan=S(value="Horizontal"), corder=S(value="Palette order"), step=I(value=6), brush=S(value=""),
             minimize=B(value=True), ontop=B(value=False), beep=B(value=True))
         self.defaults = {k: v.get() for k, v in self.v.items()}
@@ -240,6 +243,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         for n, t in tabs.items(): nb.add(t, text=n)
 
         t = tabs["Speed"]
+        r = self._row(t, "Preset"); pc = ttk.Combobox(r, textvariable=self.v["preset"], state="readonly", values=list(PRESETS)); pc.pack(side="left", fill="x", expand=True)
+        pc.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
         ttk.Label(t, text="Drawing speed", style="H.TLabel").pack(anchor="w")
         self.slider(t, "Speed (1-100)", "speed", 1, 100)
         r = ttk.Frame(t); r.pack(fill="x", pady=4)
@@ -282,10 +287,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.check(t, "Perceptual colour matching (more accurate)", "labmatch")
         self.slider(t, "Overlap % (0=no overdraw)", "overlap", 0, 40)
         self.spin(t, "Layer safety margin", "margin", 0, 4)
+        self.check(t, "Verify brush & colour while drawing", "verify")
+        self.combo(t, "Brush ends", "caps", ["Auto-detect", "Round / square", "Flat"])
         self.spin(t, "Repair passes (0-5)", "repair", 0, 5)
         self.check(t, "Repair wrong colours too (can redraw edges)", "fixwrong")
         self.slider(t, "Repair tolerance", "tol", 8, 50)
-        self.slider(t, "Remove specks (0-3)", "despeckle", 0, 3)
+        self.slider(t, "Clean up specks (0-3)", "despeckle", 0, 3)
         self.check(t, "Dither colours (smoother blends)", "dither")
         self.check(t, "Skip white (keep canvas background)", "skipwhite")
         ttk.Label(t, text="Tip: 'Most pixels first' paints big background\ncolours first; 'Serpentine' saves mouse travel.", foreground="#999").pack(anchor="w", pady=8)
@@ -309,6 +316,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.prev = tk.Label(right, text="Preview", bg="#15161b", fg="#666"); self.prev.pack(fill="both", expand=True)
 
     def say(self, t): self.status.config(text=t); self.update_idletasks()
+
+    def apply_preset(self):
+        for k, val in PRESETS.get(self.v["preset"].get(), {}).items(): self.v[k].set(val)
+        self.say("Preset applied: " + self.v["preset"].get())
 
     def reset(self):
         for k, val in self.defaults.items(): self.v[k].set(val)
@@ -422,6 +433,14 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         return im.resize((w, h), Image.BOX) if im.size != (w, h) else im
 
     @staticmethod
+    def cap_from(before, after, length, w):
+        d = np.abs(np.array(before).astype(int) - np.array(after).astype(int)).sum(2) > 60
+        cols = np.flatnonzero(d.any(axis=0))
+        if len(cols) == 0 or not w: return None
+        cap = max(0.0, min(float(w), ((cols[-1] - cols[0] + 1) - length) / 2.0))
+        return 0.0 if cap < 1.5 else round(cap, 1)      # 0 = flat ends, w/2 = round or square ends
+
+    @staticmethod
     def measure(before, after, c):
         d = np.abs(np.array(before).astype(int) - np.array(after).astype(int)).sum(2) > 60
         rows = d.mean(1) > 0.6
@@ -457,19 +476,19 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         b = self.canvas_box; W = b[2] - b[0]
         x0, x1 = int(b[0] + W * 0.2), int(b[0] + W * 0.5); xm = (x0 + x1) // 2
         box = (xm - 8, yc - half, xm + 9, yc + half + 1)
-        before = self.snap(box); bgc = before.getpixel((8, half))
+        before = self.snap(box); bgc = before.getpixel((8, half)); hb = (x0 - 90, yc - 1, x1 + 91, yc + 2); hbefore = self.snap(hb)
         if brush_pos: self.click(m, *brush_pos, 0.3)
         for p in self.palette:                       # use a colour that contrasts with the background
             if sum(abs(p["rgb"][c] - bgc[c]) for c in range(3)) > 200: self.click(m, *p["pos"], 0.3); break
         m.move(x0, yc); time.sleep(0.05); m.down(g["button"]); time.sleep(0.05)
         for q in range(1, 41): m.move(x0 + (x1 - x0) * q / 40, yc); time.sleep(0.006)
         time.sleep(0.02); m.up(g["button"]); time.sleep(0.3)
-        w = self.measure(before, self.snap(box), half); undo_failed = False
+        w = self.measure(before, self.snap(box), half); undo_failed = False; cap = self.cap_from(hbefore, self.snap(hb), x1 - x0, w)
         if g["undo"]:
             self.do_undo(m)
             back = np.array(self.snap(box)).astype(int) - np.array(before).astype(int)
             undo_failed = bool((np.abs(back).sum(2) > 60).mean() > 0.02)
-        return w, undo_failed
+        return w, undo_failed, cap
 
     def _calib(self, g, start):
         res, undo_failed, err = {}, False, ""
@@ -485,7 +504,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 yc = int(b[1] + sp * (j + 1))
                 if yc > b[3] - 4: sp = H / (n + 1); yc = int(b[1] + sp * (j + 1))   # spacing too big for canvas -> auto
                 half = int(min(150, max(6, sp / 2 - 3)))
-                w, uf = self.test_line(m, g, yc, half, self.brushes[i]["pos"]); res[i] = w; undo_failed |= uf
+                w, uf, cap = self.test_line(m, g, yc, half, self.brushes[i]["pos"]); res[i] = (w, cap); undo_failed |= uf
         except KeyboardInterrupt: err = "Stopped."
         except pyautogui.FailSafeException: err = "Stopped (failsafe corner)."
         except Exception as ex: self.log(traceback.format_exc()); err = f"Error: {ex}"
@@ -564,8 +583,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         if self.mini: self.mini.destroy(); self.mini = None
         self.deiconify()
         for i in range(start, len(self.brushes)):
-            w = res.get(i)
-            if w: self.brushes[i]["px"] = w
+            w, cap = res.get(i, (None, None))
+            if w: self.brushes[i]["px"] = w; self.brushes[i]["cap"] = cap
             elif err: self.brushes[i]["px"] = self.brushes[i]["px"] or 4 * (i + 1)
             else:
                 px = simpledialog.askinteger("Brush size", f"Couldn't measure brush {i+1} automatically (a colour that differs from the background must be selected).\nEnter its width in pixels:", initialvalue=self.brushes[i]["px"] or 4 * (i + 1), minvalue=1, maxvalue=300, parent=self)
@@ -625,6 +644,28 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         bs = self.active_brushes()
         return self.eff(min(b["px"] for b in bs)) if bs else self.eff(int(self.v["step"].get()))
 
+    def geom(self, br):
+        w = float(br["px"]) if br else float(max(1, int(self.v["step"].get())))
+        mode = self.v["caps"].get(); known = br.get("cap") if br else self.cur_cap
+        cap = 0.0 if mode.startswith("Flat") else (w / 2.0 if mode.startswith("Round") or known is None else float(known))
+        return w, cap
+
+    @staticmethod
+    def endpoints(a, b, p, w, cap, bx, by):
+        """Mouse start/end for a run of cells so the stroke covers exactly those cells (caps stay inside them)."""
+        spill = max(0.0, (w - p) / 2.0)
+        if a[1] == b[1]:
+            lo, hi = min(a[0], b[0]) * p, (max(a[0], b[0]) + 1) * p; y = (a[1] + 0.5) * p
+            s, e = lo - spill + cap, hi + spill - cap
+            if e < s: s = e = (lo + hi) / 2.0
+            if a[0] > b[0]: s, e = e, s
+            return bx + s, by + y, bx + e, by + y
+        lo, hi = min(a[1], b[1]) * p, (max(a[1], b[1]) + 1) * p; x = (a[0] + 0.5) * p
+        s, e = lo - spill + cap, hi + spill - cap
+        if e < s: s = e = (lo + hi) / 2.0
+        if a[1] > b[1]: s, e = e, s
+        return bx + x, by + s, bx + x, by + e
+
     def eff_mode(self):
         m = self.v["mode"].get(); return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
 
@@ -641,6 +682,21 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         out = np.empty(arr.shape[:2], int)
         for y in range(0, arr.shape[0], 64):
             out[y:y+64] = ((arr[y:y+64, :, None, :] - pal[None, None]) ** 2).sum(3).argmin(2)
+        return out
+
+    @staticmethod
+    def merge_specks(out, passes):
+        out = out.copy(); h, w = out.shape
+        for _ in range(passes):
+            P = np.pad(out, 1, constant_values=-2)
+            nb = [P[1+dy:1+dy+h, 1+dx:1+dx+w] for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)]
+            iso = (out >= 0) & (sum((n == out).astype(int) for n in nb) <= 1)      # a cell with at most 1 same-colour neighbour
+            if not iso.any(): break
+            best, bestc = np.full(out.shape, -1), np.zeros(out.shape, int)
+            for c in np.unique(out[out >= 0]):
+                cnt = sum((n == c).astype(int) for n in nb); better = cnt > bestc
+                best = np.where(better, c, best); bestc = np.where(better, cnt, bestc)
+            out = np.where(iso & (bestc >= 2), best, out)
         return out
 
     def build_grid(self):
@@ -690,11 +746,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             skip = ~alpha
             if g["skipwhite"]: skip |= arr.min(2) > 235
             out = np.where(skip, -1, out)
-        lvl = int(g["despeckle"])
-        if lvl > 0:
-            p = np.pad(out, 1, constant_values=-2)
-            same = sum((p[1+dy:1+dy+h, 1+dx:1+dx+w] == out).astype(int) for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)))
-            out = np.where((out >= 0) & (same < lvl), -1, out)
+        out = self.merge_specks(out, int(g["despeckle"]))
         full = -np.ones((rows, cols), int)
         oy, ox = (rows - h) // 2 + int(g["offy"] / 100 * rows), (cols - w) // 2 + int(g["offx"] / 100 * cols)
         sy, sx, dy, dx = max(0, -oy), max(0, -ox), max(0, oy), max(0, ox)
@@ -767,7 +819,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 runs = self.runs_from(grid, g)
                 if runs: per_colour.append((c, runs))
             if last and g["order"].startswith("One row"): per_colour = self.by_row(per_colour, cis, vert)
-            out.append({"brush": br, "step": s0 if last else p, "colours": per_colour, "mask": done & ~before_done})
+            w_, cap_ = self.geom(br)
+            out.append({"brush": br, "step": s0 if last else p, "colours": per_colour, "mask": done & ~before_done, "w": w_, "cap": cap_})
         return out
 
     def timing(self):
@@ -915,7 +968,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         threading.Thread(target=self.pre, args=(g, need, repair_only), daemon=True).start()
 
     def pre(self, g, need, repair_only):
-        px, note = None, ""
+        px, note, cap = None, "", None
         try:
             for s in range(g["countdown"], 0, -1):
                 if self.stop: raise KeyboardInterrupt
@@ -923,17 +976,18 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             if need:
                 self.ui("Detecting your brush width with a test line...")
                 m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box
-                px, uf = self.test_line(m, g, (b[1] + b[3]) // 2, int(min(150, max(6, (b[3] - b[1]) / 4))), None)
+                px, uf, cap = self.test_line(m, g, (b[1] + b[3]) // 2, int(min(150, max(6, (b[3] - b[1]) / 4))), None)
                 if px and not (1 <= px <= min(b[2] - b[0], b[3] - b[1]) / 3): px = None
                 note = (f"Detected brush width: {px}px. " if px else "Couldn't detect the brush width, using the manual value. ") + ("Couldn't undo the test line. " if uf else "")
         except KeyboardInterrupt: self.drawing = False; return self.after(0, self.finish, "Stopped.", False)
         except pyautogui.FailSafeException: self.drawing = False; return self.after(0, self.finish, "Stopped (failsafe corner).", False)
         except Exception as ex:
             self.log(traceback.format_exc()); self.drawing = False; return self.after(0, self.finish, f"Error: {ex}", False)
-        self.after(0, self.go, g, px, note, repair_only)
+        self.after(0, self.go, g, px, note, repair_only, cap)
 
-    def go(self, g, px, note, repair_only):
+    def go(self, g, px, note, repair_only, cap=None):
         if px: self.v["step"].set(px)
+        self.cur_cap = cap if px else None
         g = {k: v.get() for k, v in self.v.items()}
         try: self.idx, step = self.build_grid(); mode = self.eff_mode(); plan = self.make_plan(self.idx, g, mode, step)
         except ValueError as e: self.drawing = False; return self.finish(f"Error: {e}", False)
@@ -949,6 +1003,11 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             while self.paused and not self.stop: time.sleep(0.1)
             self.t0 += time.time() - p0
             if self.stop: raise KeyboardInterrupt
+
+    def verify_colour(self, mx, my, rgb, tol=45):
+        time.sleep(0.05)
+        im = np.array(self.snap((int(mx) - 3, int(my) - 3, int(mx) + 4, int(my) + 4))).astype(float).reshape(-1, 3).mean(0)
+        return float(np.linalg.norm(self.to_lab(im) - self.to_lab(np.array(rgb, float)))) < tol, im
 
     def park(self, m):
         if self.park_pt: m.move(*self.park_pt)
@@ -996,21 +1055,45 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             total = max(1.0, sum(weight(a, b, l["step"]) for l in plan for _, rs in l["colours"] for a, b in rs))
             st = {"done": 0.0, "last": 0.0}; self.t0 = time.time()
 
+            pal_all = [p["rgb"] for p in self.palette]; warns = {"brush": 0, "colour": 0}; expo = {}
+
             def draw(layers, tag, track=True):
+                nonlocal g
                 for li, layer in enumerate(layers):
-                    p, br = layer["step"], layer["brush"]
+                    p, br, w, cap = layer["step"], layer["brush"], layer["w"], layer["cap"]
                     if not layer["colours"]: continue
                     self.gate()
                     if br: self.click(m, *br["pos"], g["swdelay"])
-                    st["col"] = None
+                    st["col"] = None; bdone = False
                     for ci, runs in layer["colours"]:
                         self.gate()
-                        if pal and (st["col"] != ci or g["rebrush"]): self.click(m, *self.palette[ci]["pos"], g["swdelay"])
+                        switched = pal and (st["col"] != ci or g["rebrush"])
+                        if switched: self.click(m, *self.palette[ci]["pos"], g["swdelay"])
                         if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
-                        st["col"] = ci
+                        st["col"] = ci; cdone = not (switched and g["verify"])
                         for a, b in runs:
                             self.gate(); pause, interval = self.timing()
-                            self.stroke(m, bx + a[0] * p + p // 2, by + a[1] * p + p // 2, bx + b[0] * p + p // 2, by + b[1] * p + p // 2, g, interval)
+                            x1, y1, x2, y2 = self.endpoints(a, b, p, w, cap, bx, by)
+                            chk = br is not None and not bdone and g["verify"] and a[1] == b[1] and abs(b[0] - a[0]) >= 2
+                            if chk:
+                                H = int(min(120, max(10, w * 1.2))); mx = int((x1 + x2) / 2); box = (mx - 3, int(y1) - H, mx + 4, int(y1) + H + 1); pre = self.snap(box)
+                            self.stroke(m, x1, y1, x2, y2, g, interval)
+                            if chk:      # is the brush really the size we think? (catches a missed brush-button click)
+                                bdone = True; t = self.measure(pre, self.snap(box), H)
+                                if t is not None and abs(t - w) > max(2, 0.3 * w):
+                                    warns["brush"] += 1; self.log(f"brush check: expected {w:.0f}px, saw {t}px - re-selecting brush")
+                                    self.click(m, *br["pos"], g["swdelay"] + 0.3); self.stroke(m, x1, y1, x2, y2, g, interval)
+                            if not cdone:      # did the colour click really register?
+                                cdone = True; mx, my = (x1 + x2) / 2, (y1 + y2) / 2; want_rgb = expo.get(ci, pal_all[ci])
+                                okc, got = self.verify_colour(mx, my, want_rgb)
+                                if not okc:
+                                    self.click(m, *self.palette[ci]["pos"], g["swdelay"] + 0.25); self.stroke(m, x1, y1, x2, y2, g, interval)
+                                    ok2, got2 = self.verify_colour(mx, my, want_rgb)
+                                    if not ok2:
+                                        if float(np.linalg.norm(self.to_lab(got) - self.to_lab(got2))) < 12: expo[ci] = tuple(got2)   # app's colour just differs from its swatch
+                                        else:
+                                            warns["colour"] += 1; g = dict(g); g["swdelay"] = min(1.0, g["swdelay"] + 0.15)
+                                            self.log(f"colour check failed for colour {ci}: saw {got2.round()}")
                             if pause: time.sleep(pause)
                             if track:
                                 st["done"] += weight(a, b, p)
@@ -1033,9 +1116,13 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 self.park(m); time.sleep(0.3)
                 obs = look()
                 if obs is None: msg = "Done (couldn't read the canvas to check it)."; break
-                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"], before is not None and not g["fixwrong"]); n = int(miss.sum()); final = n
-                self.log(f"check {ps+1}: {n} of {want} spots missing (speed {int(self.spd)}, hold {g['hold']}, settle {g['settle']}, step {g['maxstep']})")
-                if not repair_only and ps == 0 and n / want > 0.7: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
+                allm = self.find_missing(idx, obs, before, pal_rgb, g["tol"], False)
+                gaps = self.find_missing(idx, obs, before, pal_rgb, g["tol"], True) if before is not None else allm
+                final = int(allm.sum()); wrong = final - int(gaps.sum())
+                miss = allm if (g["fixwrong"] or wrong > 0.03 * want) else gaps      # wrong colours are only redrawn when there are lots (a real failure, not edge noise)
+                n = int(miss.sum())
+                self.log(f"check {ps+1}: {final} of {want} spots off ({n} to repair) (speed {int(self.spd)}, hold {g['hold']}, settle {g['settle']}, step {g['maxstep']})")
+                if not repair_only and ps == 0 and final / want > 0.7: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
                 if n <= max(2, 0.002 * want) or ps == passes: break
                 if (prev is not None and n > 0.6 * prev) or n / want > 0.25:      # not converging -> slow down, be more careful
                     g = dict(g); g["hold"] = min(150, g["hold"] + 10); g["settle"] = min(150, g["settle"] + 10); g["lift"] = min(200, g["lift"] + 15); g["maxstep"] = max(3, (g["maxstep"] or 8) // 2)
@@ -1043,10 +1130,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                     self.ui(f"Gaps remain - slowing down to speed {int(self.spd)} and repairing {n} spots...", 1.0)
                 else: self.ui(f"Repairing {n} missing spots (pass {ps+1}/{passes})...", 1.0)
                 prev = n
-                draw([self.fine_layer(np.where(miss, idx, -1), s0, g, finest, mode)], "Repair", False)
+                fl = self.fine_layer(np.where(miss, idx, -1), s0, g, finest, mode); fl["w"], fl["cap"] = plan[-1]["w"], plan[-1]["cap"]
+                draw([fl], "Repair", False)
             if final is not None:
-                msg = f"Done! {100 * (1 - final / want):.1f}% of the image matches ({final} spots still missing)." if final else "Done! Checked the canvas: everything matches."
+                msg = f"Done! {100 * (1 - final / want):.1f}% of the image matches ({final} spots still blank or wrong)." if final else "Done! Checked the canvas: everything matches."
                 if final > 0.02 * want: msg += " Gaps remain: try Auto-tune speed (Speed tab) or lower the speed."
+            if (warns["brush"] or warns["colour"]) and msg.startswith("Done"): msg += f" (brush/colour selection needed {warns['brush'] + warns['colour']} retries - try the Careful preset)"
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
         except Exception as ex: self.log(traceback.format_exc()); msg = f"Error: {ex}"
@@ -1066,16 +1155,16 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     # ---------- setup files ----------
     def cfg_dict(self):
-        return {"ver": 6, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
+        return {"ver": 7, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
 
     def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
         self.undo_pos = tuple(d["undo_pos"]) if d.get("undo_pos") else None
-        old = d.get("ver", 0) < 6
+        old = d.get("ver", 0) < 7
         for k, val in d.get("settings", {}).items():
-            if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift", "margin", "overlap"): continue
+            if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift", "margin", "overlap", "despeckle"): continue
             if k in self.v:
                 try: self.v[k].set(val)
                 except Exception: pass
