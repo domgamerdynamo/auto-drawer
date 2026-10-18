@@ -65,8 +65,9 @@ class Mouse:
         else: pyautogui.mouseUp(button=b)
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
+ORDERS = ["Layers (big brush → small brush)", "One colour at a time", "One row at a time (all colours per row)"]
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
-                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "layers", "labmatch", "overlap"]
+                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "order", "labmatch", "overlap"]
 
 
 class App((TkinterDnD.Tk if DND else tk.Tk)):
@@ -84,7 +85,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             speed=D(value=70), dragpts=I(value=3), hold=I(value=20), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
-            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), overlap=D(value=10), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"),
+            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), overlap=D(value=10), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
@@ -275,7 +276,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.combo(t, "Fit", "fit", ["Fit (keep ratio)", "Stretch to canvas"])
         self.combo(t, "Stroke direction", "scan", ["Horizontal", "Vertical", "Serpentine"])
         self.combo(t, "Colour order", "corder", ["Palette order", "Lightest first", "Darkest first", "Most pixels first", "Fewest pixels first"])
-        self.check(t, "Layers: big brush first, small brush last", "layers")
+        self.combo(t, "Draw order", "order", ORDERS)
+        ttk.Label(t, text="Layers: big brush fills solid areas first, small brush adds detail (needs 2+ brushes).\nOne colour at a time: finish a whole colour before the next.\nOne row at a time: complete each row (every colour in it) before the next row.", foreground="#999", wraplength=360, justify="left").pack(anchor="w", pady=2)
         self.check(t, "Re-click brush after each colour change", "rebrush")
         self.check(t, "Perceptual colour matching (more accurate)", "labmatch")
         self.slider(t, "Stroke overlap %", "overlap", 0, 40)
@@ -614,7 +616,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         valid = sorted((b for b in self.brushes if b["px"] > 0), key=lambda b: -b["px"]); uniq = []
         for b in valid:                                    # ignore near-duplicate sizes
             if not uniq or uniq[-1]["px"] - b["px"] >= 2: uniq.append(b)
-        if self.v["layers"].get() and len(uniq) >= 2: return uniq     # big -> small
+        if self.v["order"].get().startswith("Layers") and len(uniq) >= 2: return uniq     # big -> small
         b = self.cur_brush(); return [b] if b and b["px"] > 0 else []
 
     def step_px(self):
@@ -709,6 +711,18 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 s, e = int(s), int(e); runs.append(((r, s), (r, e)) if vert else ((s, r), (e, r)))
         return runs
 
+    @staticmethod
+    def by_row(per_colour, cis, vert):
+        rows = {}
+        for c, runs in per_colour:
+            for run in runs: rows.setdefault(run[0][0] if vert else run[0][1], {}).setdefault(c, []).append(run)
+        out = []
+        for i, key in enumerate(sorted(rows)):
+            cs = [c for c in cis if c in rows[key]]
+            if i % 2: cs.reverse()      # alternate colour order so one row ends on the colour the next row starts with
+            out += [(c, rows[key][c]) for c in cs]
+        return out
+
     def make_plan(self, idx, g, mode, s0):
         """Returns layers (big brush -> small brush). A big-brush layer only paints blocks that are ONE colour and not yet
         painted, so strokes never run over other colours; whatever is left is filled by the smaller brushes."""
@@ -742,6 +756,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                     done |= mask & full[ys[:, None], xs[None, :]]; grid = full[:R, :C]
                 runs = self.runs_from(grid, g)
                 if runs: per_colour.append((c, runs))
+            if last and g["order"].startswith("One row"): per_colour = self.by_row(per_colour, cis, vert)
             out.append({"brush": br, "step": s0 if last else p, "colours": per_colour, "mask": done & ~before_done})
         return out
 
@@ -768,8 +783,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 for a, b in runs: n += 1; plen += (abs(b[0] - a[0]) + abs(b[1] - a[1])) * l["step"]
         pause, iv = self.timing(); est = n * (2 * pause + 0.03) + plen / max(1, g["maxstep"] or 8) * (iv + 0.0004)
         info = "   |   ".join(f"L{i+1}: {l['step']}px x{sum(len(r) for _, r in l['colours'])}" for i, l in enumerate(plan))
-        if g["layers"] and len(self.active_brushes()) < 2:
-            info = "Layers are OFF: fewer than 2 brush sizes known. Click 2+ brush-size buttons, then Auto-measure.   " + info
+        if g["order"].startswith("Layers") and len(self.active_brushes()) < 2:
+            info = "Layers need 2+ measured brush sizes (Brush card: click brush buttons, then Auto-measure). Drawing one colour at a time until then.   " + info
+        elif g["order"].startswith("One row"): info = "Row by row: each row is finished (all its colours) before the next.   " + info
         self.layer_lbl.config(text=info)
         self.say(f"{mode} | {len(plan)} layer(s) | {n} strokes | est. ~{int(est//60)}m {int(est%60)}s at current speed")
 
@@ -974,10 +990,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                     if not layer["colours"]: continue
                     self.gate()
                     if br: self.click(m, *br["pos"], g["swdelay"])
+                    st["col"] = None
                     for ci, runs in layer["colours"]:
                         self.gate()
-                        if pal: self.click(m, *self.palette[ci]["pos"], g["swdelay"])
+                        if pal and (st["col"] != ci or g["rebrush"]): self.click(m, *self.palette[ci]["pos"], g["swdelay"])
                         if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
+                        st["col"] = ci
                         for a, b in runs:
                             self.gate(); pause, interval = self.timing()
                             self.stroke(m, bx + a[0] * p + p // 2, by + a[1] * p + p // 2, bx + b[0] * p + p // 2, by + b[1] * p + p // 2, g, interval)
