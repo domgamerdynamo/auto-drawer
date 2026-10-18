@@ -425,6 +425,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 if best is None or key < best[0]: best = (key, x, y)
         return best[1], best[2], best[0][0] > 0
 
+    def gscale(self):
+        if getattr(self, "_gs", None) is None:
+            try: self._gs = ImageGrab.grab().width / max(1, self.winfo_screenwidth())
+            except Exception: self._gs = 1.0
+        return self._gs
+
     def snap(self, box):
         k = self.gscale(); b2 = tuple(int(round(v * k)) for v in box) if abs(k - 1) > 0.02 else tuple(box)
         try: im = ImageGrab.grab(bbox=b2, all_screens=True).convert("RGB")
@@ -438,7 +444,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         cols = np.flatnonzero(d.any(axis=0))
         if len(cols) == 0 or not w: return None
         cap = max(0.0, min(float(w), ((cols[-1] - cols[0] + 1) - length) / 2.0))
-        return 0.0 if cap < 1.5 else round(cap, 1)      # 0 = flat ends, w/2 = round or square ends
+        return 0.0 if cap < 1.5 else round(float(cap), 1)      # 0 = flat ends, w/2 = round or square ends
 
     @staticmethod
     def measure(before, after, c):
