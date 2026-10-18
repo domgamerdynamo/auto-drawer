@@ -3,7 +3,7 @@ Auto Drawer Pro v2 - draws a reference image onto any on-screen canvas with your
 Hotkeys while drawing:  F8 pause/resume | F9 slower | F10 faster | ESC stop
 Emergency stop: slam the mouse into the TOP-LEFT screen corner.
 """
-import sys, os, json, threading, time, queue
+import sys, os, json, threading, time, queue, math, traceback
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
@@ -66,7 +66,7 @@ class Mouse:
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
-                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "layers", "labmatch"]
+                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "layers", "labmatch", "overlap"]
 
 
 class App((TkinterDnD.Tk if DND else tk.Tk)):
@@ -78,11 +78,13 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.stop = self.paused = self.drawing = False
         self.spd, self.t0 = 70.0, 0.0
         self.hk = queue.Queue(); self.rebind = None; self.keys = {}; self.keybtns = {}
+        self.undo_pos = self.last_before = self.last_plan = self.park_pt = None; self.last_mode = "Black & white"
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
             speed=D(value=70), dragpts=I(value=3), hold=I(value=10), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
+            maxstep=I(value=8), overlap=D(value=10), repair=I(value=2), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
@@ -105,6 +107,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.v["speed"].trace_add("write", lambda *a: setattr(self, "spd", float(self.v["speed"].get())))
         self.v["ontop"].trace_add("write", lambda *a: self.attributes("-topmost", bool(self.v["ontop"].get())))
         for k in PREVIEW_KEYS: self.v[k].trace_add("write", self.sched_prev)
+        self.v["showlayer"].trace_add("write", lambda *a: self.render_preview())
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.refresh(); self.after(100, self.poll)
 
@@ -213,7 +216,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         r = ttk.Frame(f); r.pack(fill="x")
         ttk.Button(r, text="Click brush buttons", command=self.click_brushes).pack(side="left", expand=True, fill="x")
         ttk.Button(r, text="Auto-measure sizes", command=lambda: self.calibrate(0)).pack(side="left", expand=True, fill="x", padx=(4, 0))
-        ttk.Checkbutton(f, text="Undo test lines with Ctrl+Z", variable=self.v["undo"]).pack(anchor="w")
+        ttk.Checkbutton(f, text="Undo test lines afterwards (Ctrl+Z / undo button)", variable=self.v["undo"]).pack(anchor="w")
+        ttk.Button(f, text="Pick undo button (optional)", command=self.pick_undo).pack(fill="x", pady=2)
+        ttk.Checkbutton(f, text="Auto-detect brush width if no brush is set", variable=self.v["autobrush"]).pack(anchor="w")
         r = ttk.Frame(f); r.pack(fill="x", pady=3); ttk.Label(r, text="Use:").pack(side="left")
         self.cb = ttk.Combobox(r, textvariable=self.v["brush"], state="readonly", width=20); self.cb.pack(side="left", padx=4)
         ttk.Button(r, text="Clear", width=6, command=lambda: (self.brushes.clear(), self.refresh())).pack(side="right")
@@ -225,7 +230,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             ttk.Button(r, text=t, command=c).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(r, text="Save", width=5, command=self.save_cfg).pack(side="left", padx=2)
         ttk.Button(r, text="Load", width=5, command=self.load_cfg).pack(side="left", padx=2)
-        ttk.Button(left, text="START DRAWING", style="Go.TButton", command=self.start).pack(fill="x", padx=2, pady=4)
+        ttk.Button(left, text="START DRAWING", style="Go.TButton", command=self.start).pack(fill="x", padx=2, pady=(4, 1))
+        ttk.Button(left, text="Repair gaps (check canvas & redraw missing)", command=lambda: self.start(True)).pack(fill="x", padx=2, pady=1)
         self.status = tk.Label(left, text="Ready", bg=BG, fg="#aaa", wraplength=320, justify="left"); self.status.pack(anchor="w")
 
         nb = ttk.Notebook(mid); nb.pack(fill="both", expand=True)
@@ -241,6 +247,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Label(t, text="Speed can be changed LIVE while drawing\n(F9 slower / F10 faster, or the mini panel).", foreground="#999").pack(anchor="w", pady=(0, 8))
         ttk.Separator(t).pack(fill="x", pady=4)
         self.spin(t, "Smooth drag points", "dragpts", 0, 10)
+        self.spin(t, "Max move step px", "maxstep", 0, 60)
         self.spin(t, "Mouse-down hold ms", "hold", 0, 300, 5)
         self.spin(t, "Colour switch delay", "swdelay", 0, 3, 0.05)
         self.spin(t, "Start countdown (s)", "countdown", 1, 20)
@@ -268,6 +275,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.check(t, "Layers: big brush first, small brush last", "layers")
         self.check(t, "Re-click brush after each colour change", "rebrush")
         self.check(t, "Perceptual colour matching (more accurate)", "labmatch")
+        self.slider(t, "Stroke overlap %", "overlap", 0, 40)
+        self.spin(t, "Repair passes (0-5)", "repair", 0, 5)
+        self.slider(t, "Repair tolerance", "tol", 8, 50)
         self.slider(t, "Remove specks (0-3)", "despeckle", 0, 3)
         self.check(t, "Dither colours (smoother blends)", "dither")
         self.check(t, "Skip white (keep canvas background)", "skipwhite")
@@ -285,6 +295,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Button(t, text="Reset keybinds", command=self.reset_keys).pack(anchor="w", pady=4)
         ttk.Label(t, text="Pick keys your drawing app doesn't use (F-keys are safest).\nTop-left screen corner = emergency stop.\nYour setup is saved automatically on exit.", foreground="#999").pack(anchor="w")
 
+        top = tk.Frame(right, bg=BG); top.pack(fill="x")
+        tk.Label(top, text="Show:", bg=BG, fg=FG).pack(side="left", padx=(0, 6))
+        self.layer_cb = ttk.Combobox(top, textvariable=self.v["showlayer"], state="readonly", width=24); self.layer_cb.pack(side="left")
+        self.layer_lbl = tk.Label(right, text="", bg=BG, fg="#aaa", wraplength=620, justify="left", anchor="w"); self.layer_lbl.pack(fill="x", pady=4)
         self.prev = tk.Label(right, text="Preview", bg="#15161b", fg="#666"); self.prev.pack(fill="both", expand=True)
 
     def say(self, t): self.status.config(text=t); self.update_idletasks()
@@ -416,10 +430,38 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.open_mini(); self.withdraw()
         threading.Thread(target=self._calib, args=(g, start), daemon=True).start()
 
+    def do_undo(self, m):
+        if self.undo_pos: self.click(m, *self.undo_pos, 0.4)
+        else: pyautogui.hotkey("command" if sys.platform == "darwin" else "ctrl", "z"); time.sleep(0.4)
+
+    def pick_undo(self):
+        def done(pts):
+            if pts: self.undo_pos = (pts[0][0], pts[0][1]); self.say("Undo button saved.")
+        self.click_select("Click your app's UNDO button once.", done)
+
+    def test_line(self, m, g, yc, half, brush_pos=None):
+        """Select a brush (optional), draw a short test line, measure its thickness in px, then undo it."""
+        b = self.canvas_box; W = b[2] - b[0]
+        x0, x1 = int(b[0] + W * 0.2), int(b[0] + W * 0.5); xm = (x0 + x1) // 2
+        box = (xm - 8, yc - half, xm + 9, yc + half + 1)
+        before = self.snap(box); bgc = before.getpixel((8, half))
+        if brush_pos: self.click(m, *brush_pos, 0.3)
+        for p in self.palette:                       # use a colour that contrasts with the background
+            if sum(abs(p["rgb"][c] - bgc[c]) for c in range(3)) > 200: self.click(m, *p["pos"], 0.3); break
+        m.move(x0, yc); time.sleep(0.05); m.down(g["button"]); time.sleep(0.05)
+        for q in range(1, 41): m.move(x0 + (x1 - x0) * q / 40, yc); time.sleep(0.006)
+        time.sleep(0.02); m.up(g["button"]); time.sleep(0.3)
+        w = self.measure(before, self.snap(box), half); undo_failed = False
+        if g["undo"]:
+            self.do_undo(m)
+            back = np.array(self.snap(box)).astype(int) - np.array(before).astype(int)
+            undo_failed = bool((np.abs(back).sum(2) > 60).mean() > 0.02)
+        return w, undo_failed
+
     def _calib(self, g, start):
         res, undo_failed, err = {}, False, ""
         try:
-            m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box; W, H = b[2] - b[0], b[3] - b[1]
+            m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box; H = b[3] - b[1]
             idxs = list(range(start, len(self.brushes))); n = len(idxs)
             for s in range(3, 0, -1):
                 if self.stop: raise KeyboardInterrupt
@@ -430,23 +472,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 yc = int(b[1] + sp * (j + 1))
                 if yc > b[3] - 4: sp = H / (n + 1); yc = int(b[1] + sp * (j + 1))   # spacing too big for canvas -> auto
                 half = int(min(150, max(6, sp / 2 - 3)))
-                x0, x1 = int(b[0] + W * 0.2), int(b[0] + W * 0.5); xm = (x0 + x1) // 2
-                box = (xm - 8, yc - half, xm + 9, yc + half + 1)
-                before = self.snap(box); bgc = before.getpixel((8, half))
-                self.click(m, *self.brushes[i]["pos"], 0.3)
-                for p in self.palette:                       # use a colour that contrasts with the background
-                    if sum(abs(p["rgb"][c] - bgc[c]) for c in range(3)) > 200: self.click(m, *p["pos"], 0.3); break
-                m.move(x0, yc); time.sleep(0.05); m.down(); time.sleep(0.05)
-                for q in range(1, 31): m.move(x0 + (x1 - x0) * q / 30, yc); time.sleep(0.006)
-                m.up(); time.sleep(0.3)
-                res[i] = self.measure(before, self.snap(box), half)
-                if g["undo"]:
-                    pyautogui.hotkey("command" if sys.platform == "darwin" else "ctrl", "z"); time.sleep(0.4)
-                    back = np.array(self.snap(box)).astype(int) - np.array(before).astype(int)
-                    if (np.abs(back).sum(2) > 60).mean() > 0.02: undo_failed = True
+                w, uf = self.test_line(m, g, yc, half, self.brushes[i]["pos"]); res[i] = w; undo_failed |= uf
         except KeyboardInterrupt: err = "Stopped."
         except pyautogui.FailSafeException: err = "Stopped (failsafe corner)."
-        except Exception as ex: err = f"Error: {ex}"
+        except Exception as ex: self.log(traceback.format_exc()); err = f"Error: {ex}"
         self.drawing = False; self.after(0, self.calib_done, start, res, undo_failed, err)
 
     def calib_done(self, start, res, undo_failed, err):
@@ -501,13 +530,18 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         n = self.v["brush"].get(); names = self.brush_names()
         return self.brushes[names.index(n)] if n in names else None
 
+    def eff(self, px): return max(1, int(round(px * (1 - self.v["overlap"].get() / 100.0))))
+
     def active_brushes(self):
-        valid = [b for b in self.brushes if b["px"] > 0]
-        if self.v["layers"].get() and len(valid) >= 2: return sorted(valid, key=lambda b: -b["px"])   # big -> small
+        valid = sorted((b for b in self.brushes if b["px"] > 0), key=lambda b: -b["px"]); uniq = []
+        for b in valid:                                    # ignore near-duplicate sizes
+            if not uniq or uniq[-1]["px"] - b["px"] >= 2: uniq.append(b)
+        if self.v["layers"].get() and len(uniq) >= 2: return uniq     # big -> small
         b = self.cur_brush(); return [b] if b and b["px"] > 0 else []
 
     def step_px(self):
-        bs = self.active_brushes(); return min(b["px"] for b in bs) if bs else max(1, int(self.v["step"].get()))
+        bs = self.active_brushes()
+        return self.eff(min(b["px"] for b in bs)) if bs else self.eff(int(self.v["step"].get()))
 
     def eff_mode(self):
         m = self.v["mode"].get(); return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
@@ -609,11 +643,11 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         elif o == "Darkest first": cis.sort(key=lum)
         elif o == "Most pixels first": cis.sort(key=lambda c: -counts[c])
         elif o == "Fewest pixels first": cis.sort(key=lambda c: counts[c])
-        layers = [(b, b["px"]) for b in self.active_brushes()] or [(None, s0)]
+        layers = [(b, self.eff(b["px"])) for b in self.active_brushes()] or [(None, s0)]
         done = np.zeros(idx.shape, bool); fy = np.arange(rows) * s0 + s0 / 2; fx = np.arange(cols) * s0 + s0 / 2
         vert = g["scan"] == "Vertical"; out = []
         for li, (br, p) in enumerate(layers):
-            last = li == len(layers) - 1; per_colour = []
+            last = li == len(layers) - 1; per_colour = []; before_done = done.copy()
             if not last:
                 R, C = (rows * s0) // p, (cols * s0) // p
                 ys = np.minimum((fy // p).astype(int), R); xs = np.minimum((fx // p).astype(int), C)
@@ -630,12 +664,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                     done |= mask & full[ys[:, None], xs[None, :]]; grid = full[:R, :C]
                 runs = self.runs_from(grid, g)
                 if runs: per_colour.append((c, runs))
-            out.append({"brush": br, "step": s0 if last else p, "colours": per_colour})
+            out.append({"brush": br, "step": s0 if last else p, "colours": per_colour, "mask": done & ~before_done})
         return out
 
     def timing(self):
         s = self.spd / 100.0
-        return 0.08 * (1 - s) ** 2, 0.3 * (1 - s) ** 3   # pause between mouse actions, drag duration
+        return 0.06 * (1 - s) ** 2, 0.0005 + 0.02 * (1 - s) ** 2   # pause after each stroke, delay between mouse-move events
 
     def sched_prev(self, *a):
         if self.pid: self.after_cancel(self.pid)
@@ -644,31 +678,50 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
     def preview(self):
         try: self.idx, step = self.build_grid()
         except ValueError as e: return self.say(str(e))
-        mode = self.eff_mode()
-        cols = [p["rgb"] for p in self.palette] if mode == "Palette colours" else [(0, 0, 0)]
-        px = np.full((*self.idx.shape, 3), 255, np.uint8)
-        for i, c in enumerate(cols): px[self.idx == i] = c
-        im = Image.fromarray(px); sc = min(560 / im.width, 700 / im.height)
+        g = {k: v.get() for k, v in self.v.items()}; mode = self.eff_mode()
+        self.last_mode = mode; self.last_plan = plan = self.make_plan(self.idx, g, mode, step)
+        names = ["All layers"] + [f"Layer {i+1} · {l['step']}px" for i, l in enumerate(plan)]
+        self.layer_cb["values"] = names
+        if self.v["showlayer"].get() not in names: self.v["showlayer"].set("All layers")
+        self.render_preview()
+        n, plen = 0, 0
+        for l in plan:
+            for _, runs in l["colours"]:
+                for a, b in runs: n += 1; plen += (abs(b[0] - a[0]) + abs(b[1] - a[1])) * l["step"]
+        pause, iv = self.timing(); est = n * (2 * pause + 0.03) + plen / max(1, g["maxstep"] or 8) * (iv + 0.0004)
+        info = "   |   ".join(f"L{i+1}: {l['step']}px x{sum(len(r) for _, r in l['colours'])}" for i, l in enumerate(plan))
+        if g["layers"] and len(self.active_brushes()) < 2:
+            info = "Layers are OFF: fewer than 2 brush sizes known. Click 2+ brush-size buttons, then Auto-measure.   " + info
+        self.layer_lbl.config(text=info)
+        self.say(f"{mode} | {len(plan)} layer(s) | {n} strokes | est. ~{int(est//60)}m {int(est%60)}s at current speed")
+
+    def render_preview(self):
+        if self.idx is None or not self.last_plan: return
+        cols = [p["rgb"] for p in self.palette] if self.last_mode == "Palette colours" else [(0, 0, 0)]
+        names = list(self.layer_cb["values"]); sel = self.v["showlayer"].get(); show, bgc = self.idx, 255
+        if sel in names and names.index(sel) > 0:
+            show = np.where(self.last_plan[names.index(sel) - 1]["mask"], self.idx, -1); bgc = 225
+        px = np.full((*self.idx.shape, 3), bgc, np.uint8)
+        for i, c in enumerate(cols): px[show == i] = c
+        im = Image.fromarray(px); sc = min(560 / im.width, 660 / im.height)
         im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.NEAREST)
         self.tkp = ImageTk.PhotoImage(im); self.prev.config(image=self.tkp, text="")
-        plan = self.make_plan(self.idx, {k: v.get() for k, v in self.v.items()}, mode, step)
-        n = sum(len(r) for l in plan for _, r in l["colours"]); pause, dur = self.timing(); est = n * (2 * pause + dur + 0.03)
-        self.say(f"{mode} | {len(plan)} layer(s) | {n} strokes | finest brush {step}px | est. ~{int(est//60)}m {int(est%60)}s at current speed")
 
     # ---------- drawing ----------
     def click(self, m, x, y, wait=0.15):
         m.move(x, y); time.sleep(0.06); m.down(); time.sleep(0.06); m.up(); time.sleep(wait)
 
-    def stroke(self, m, xa, ya, xb, yb, g, dur):
-        hold = g["hold"] / 1000.0; n = max(1, int(g["dragpts"]))
-        m.move(xa, ya); time.sleep(0.003)
+    def stroke(self, m, xa, ya, xb, yb, g, interval):
+        hold = g["hold"] / 1000.0; dist = math.hypot(xb - xa, yb - ya)
+        n = max(1, int(g["dragpts"]), math.ceil(dist / g["maxstep"]) if g["maxstep"] > 0 else 1)
+        m.move(xa, ya); time.sleep(0.004)
         m.down(g["button"]); time.sleep(hold)
-        if (xa, ya) == (xb, yb):
+        if dist == 0:
             if g["nudge"]: m.move(xa + 1, ya); time.sleep(0.003); m.move(xa, ya); time.sleep(0.003)
         else:
             for i in range(1, n + 1):
-                m.move(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n); time.sleep(max(dur / n, 0.002))
-        m.up(g["button"])
+                m.move(xa + (xb - xa) * i / n, ya + (yb - ya) * i / n); time.sleep(interval)
+        time.sleep(0.003); m.up(g["button"])
 
     def glide(self, m, xa, ya, xb, yb, steps=30):
         for i in range(1, steps + 1): m.move(xa + (xb - xa) * i / steps, ya + (yb - ya) * i / steps); time.sleep(0.01)
@@ -697,15 +750,15 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 if brush: self.click(m, *brush["pos"], g["swdelay"])
                 if self.palette: self.click(m, *self.palette[0]["pos"], g["swdelay"])
                 cy, w = (b[1] + b[3]) // 2, b[2] - b[0]
-                self.stroke(m, b[0] + w * 0.2, cy, b[0] + w * 0.8, cy, g, 0.5)
-                self.stroke(m, b[0] + w * 0.5, cy + 50, b[0] + w * 0.5, cy + 50, g, 0)
+                self.stroke(m, b[0] + w * 0.2, cy, b[0] + w * 0.8, cy, g, 0.004)
+                self.stroke(m, b[0] + w * 0.5, cy + 50, b[0] + w * 0.5, cy + 50, g, 0.004)
             except Exception as ex: msg = f"Test error: {ex}"
             self.after(0, self.deiconify); self.after(0, self.say, msg)
         threading.Thread(target=go, daemon=True).start()
 
     def open_mini(self):
         m = self.mini = tk.Toplevel(self); m.title("Auto Drawer"); m.attributes("-topmost", True); m.configure(bg=CARD); m.resizable(False, False)
-        x, y = self.mini_pos(310, 215); m.geometry(f"310x215+{x}+{y}")
+        x, y = self.mini_pos(310, 215); m.geometry(f"310x215+{x}+{y}"); self.park_pt = (x + 155, y + 100)
         m.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "stop", True))
         self.mt = tk.StringVar(value="Starting...")
         ttk.Label(m, textvariable=self.mt, wraplength=290).pack(padx=10, pady=(10, 4), anchor="w")
@@ -724,57 +777,140 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     def ui(self, text, frac=None): self.after(0, self.set_progress, frac, text)
 
-    def start(self):
+    def log(self, msg):
+        try:
+            with open(os.path.join(os.path.expanduser("~"), "autodrawer.log"), "a") as f: f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+        except Exception: pass
+
+    def start(self, repair_only=False):
         if self.drawing: return
-        try: self.idx, step = self.build_grid()
+        if self.img is None or self.canvas_box is None: return messagebox.showinfo("Setup", "Add a reference image and select the canvas first.")
+        try: self.idx, _ = self.build_grid()
         except ValueError as e: return messagebox.showinfo("Setup", str(e))
-        g = {k: v.get() for k, v in self.v.items()}; mode = self.eff_mode()
-        plan = self.make_plan(self.idx, g, mode, step)
-        if not any(l["colours"] for l in plan): return messagebox.showinfo("Nothing to draw", "Nothing to draw with these settings.")
+        g = {k: v.get() for k, v in self.v.items()}
+        need = (not repair_only) and g["autobrush"] and not self.active_brushes()
         self.stop = self.paused = False; self.drawing = True
         self.open_mini()
         if g["minimize"]: self.withdraw()
-        threading.Thread(target=self.run, args=(plan, g, mode), daemon=True).start()
+        threading.Thread(target=self.pre, args=(g, need, repair_only), daemon=True).start()
+
+    def pre(self, g, need, repair_only):
+        px, note = None, ""
+        try:
+            for s in range(g["countdown"], 0, -1):
+                if self.stop: raise KeyboardInterrupt
+                self.ui(f"Starting in {s}s - click on your drawing app now!"); time.sleep(1)
+            if need:
+                self.ui("Detecting your brush width with a test line...")
+                m = Mouse(g["input"].startswith("Windows")); b = self.canvas_box
+                px, uf = self.test_line(m, g, (b[1] + b[3]) // 2, int(min(150, max(6, (b[3] - b[1]) / 4))), None)
+                note = (f"Detected brush width: {px}px. " if px else "Couldn't detect the brush width, using the manual value. ") + ("Couldn't undo the test line. " if uf else "")
+        except KeyboardInterrupt: self.drawing = False; return self.after(0, self.finish, "Stopped.", False)
+        except pyautogui.FailSafeException: self.drawing = False; return self.after(0, self.finish, "Stopped (failsafe corner).", False)
+        except Exception as ex:
+            self.log(traceback.format_exc()); self.drawing = False; return self.after(0, self.finish, f"Error: {ex}", False)
+        self.after(0, self.go, g, px, note, repair_only)
+
+    def go(self, g, px, note, repair_only):
+        if px: self.v["step"].set(px)
+        g = {k: v.get() for k, v in self.v.items()}
+        try: self.idx, step = self.build_grid(); mode = self.eff_mode(); plan = self.make_plan(self.idx, g, mode, step)
+        except ValueError as e: self.drawing = False; return self.finish(f"Error: {e}", False)
+        if not any(l["colours"] for l in plan): self.drawing = False; return self.finish("Nothing to draw with these settings.", False)
+        self.say(note + f"Drawing {len(plan)} layer(s), finest step {step}px.")
+        threading.Thread(target=self.run, args=(plan, g, mode, step, self.idx.copy(), repair_only), daemon=True).start()
 
     def gate(self):
         if tuple(pyautogui.position()) == (0, 0): raise pyautogui.FailSafeException()
         if self.stop: raise KeyboardInterrupt
         if self.paused:
-            p0 = time.time(); self.ui("Paused - F8 or the Resume button to continue")
+            p0 = time.time(); self.ui("Paused - press your pause key or the Resume button")
             while self.paused and not self.stop: time.sleep(0.1)
             self.t0 += time.time() - p0
             if self.stop: raise KeyboardInterrupt
 
-    def run(self, plan, g, mode):
+    def park(self, m):
+        if self.park_pt: m.move(*self.park_pt)
+
+    def observe(self, rows, cols, s0):
+        """Average colour of the centre of every grid cell on the live canvas."""
+        try:
+            img = np.array(self.snap(tuple(self.canvas_box))).astype(float)
+            if img.shape[0] < rows * s0 or img.shape[1] < cols * s0: return None
+            a = img[:rows * s0, :cols * s0].reshape(rows, s0, cols, s0, 3); lo = s0 // 4; hi = max(lo + 1, s0 - lo)
+            return a[:, lo:hi, :, lo:hi].mean((1, 3))
+        except Exception: self.log(traceback.format_exc()); return None
+
+    def find_missing(self, idx, obs, before, pal_rgb, tol):
+        lab = self.to_lab(obs); want = idx >= 0
+        if pal_rgb:
+            exp = np.array(pal_rgb, float); labb = self.to_lab(before) if before is not None else None
+            for c in range(len(exp)):      # learn how each palette colour really looks on this canvas
+                cells = idx == c
+                if labb is not None: cells = cells & (np.linalg.norm(lab - labb, axis=2) > 12)
+                sel = cells & (np.linalg.norm(lab - self.to_lab(exp[c]), axis=2) < 45)
+                if sel.sum() >= 5: exp[c] = np.median(obs[sel], axis=0)
+            ok = np.linalg.norm(lab - self.to_lab(exp)[np.clip(idx, 0, None)], axis=2) < tol
+        else:
+            if before is None: return np.zeros(idx.shape, bool)
+            ok = np.linalg.norm(lab - self.to_lab(before), axis=2) > 12
+        return want & ~ok
+
+    def fine_layer(self, idx_m, s0, g, brush, mode):
+        cis = [c for c in (range(len(self.palette)) if mode == "Palette colours" else [0]) if (idx_m == c).any()]
+        return {"brush": brush, "step": s0, "colours": [(c, self.runs_from(idx_m == c, g)) for c in cis]}
+
+    def run(self, plan, g, mode, s0, idx, repair_only=False):
         msg, m = "Done!", None
         try:
-            m = Mouse(g["input"].startswith("Windows")); bx, by = self.canvas_box[:2]
-            for s in range(g["countdown"], 0, -1):
-                if self.stop: raise KeyboardInterrupt
-                self.ui(f"Starting in {s}s - click on your drawing app now!"); time.sleep(1)
-            total = max(1, sum(len(r) for l in plan for _, r in l["colours"])); done, last = 0, 0
-            self.t0 = time.time()
-            for li, layer in enumerate(plan):
-                p, br = layer["step"], layer["brush"]
-                if not layer["colours"]: continue
-                self.gate()
-                if br: self.click(m, *br["pos"], g["swdelay"])
-                for ci, runs in layer["colours"]:
+            m = Mouse(g["input"].startswith("Windows")); bx, by = self.canvas_box[:2]; pal = mode == "Palette colours"
+            rows, cols = idx.shape; want = max(1, int((idx >= 0).sum()))
+            self.park(m); time.sleep(0.2)
+            before = self.last_before if repair_only else self.observe(rows, cols, s0)
+            if before is not None and before.shape[:2] != idx.shape: before = None
+            if not repair_only: self.last_before = before
+            weight = lambda a, b, p: 1 + (abs(b[0] - a[0]) + abs(b[1] - a[1])) * p / 16.0
+            total = max(1.0, sum(weight(a, b, l["step"]) for l in plan for _, rs in l["colours"] for a, b in rs))
+            st = {"done": 0.0, "last": 0.0}; self.t0 = time.time()
+
+            def draw(layers, tag, track=True):
+                for li, layer in enumerate(layers):
+                    p, br = layer["step"], layer["brush"]
+                    if not layer["colours"]: continue
                     self.gate()
-                    if mode == "Palette colours": self.click(m, *self.palette[ci]["pos"], g["swdelay"])
-                    if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
-                    for a, b in runs:
-                        self.gate(); pause, dur = self.timing()
-                        self.stroke(m, bx + a[0] * p + p // 2, by + a[1] * p + p // 2,
-                                    bx + b[0] * p + p // 2, by + b[1] * p + p // 2, g, dur)
-                        if pause: time.sleep(pause)
-                        done += 1
-                        if time.time() - last > 0.25:
-                            last = time.time(); el = last - self.t0; rem = el / done * (total - done)
-                            self.ui(f"Layer {li+1}/{len(plan)} | {done*100//total}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", done / total)
+                    if br: self.click(m, *br["pos"], g["swdelay"])
+                    for ci, runs in layer["colours"]:
+                        self.gate()
+                        if pal: self.click(m, *self.palette[ci]["pos"], g["swdelay"])
+                        if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
+                        for a, b in runs:
+                            self.gate(); pause, interval = self.timing()
+                            self.stroke(m, bx + a[0] * p + p // 2, by + a[1] * p + p // 2, bx + b[0] * p + p // 2, by + b[1] * p + p // 2, g, interval)
+                            if pause: time.sleep(pause)
+                            if track:
+                                st["done"] += weight(a, b, p)
+                                if time.time() - st["last"] > 0.25:
+                                    st["last"] = time.time(); rem = (st["last"] - self.t0) / st["done"] * (total - st["done"])
+                                    self.ui(f"{tag} {li+1}/{len(layers)} | {int(st['done']*100//total)}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", st["done"] / total)
+
+            if not repair_only: draw(plan, "Layer")
+            passes = max(1, int(g["repair"])) if repair_only else int(g["repair"])
+            if repair_only and not pal and before is None: msg = "Repair needs Palette colours mode, or a drawing run first in this session."; passes = 0
+            finest = (self.active_brushes() or [None])[-1]; pal_rgb = [p["rgb"] for p in self.palette] if pal else None
+            for ps in range(passes):
+                self.gate(); self.ui(f"Checking the drawing (pass {ps+1}/{passes})...", 1.0)
+                self.park(m); time.sleep(0.3)
+                obs = self.observe(rows, cols, s0)
+                if obs is None: msg = "Done (couldn't read the canvas to check it)."; break
+                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"]); n = int(miss.sum())
+                self.log(f"check {ps+1}: {n} of {want} cells missing")
+                if not repair_only and ps == 0 and n / want > 0.7: msg = "Done (the canvas check didn't match, so repair was skipped)."; break
+                if n <= max(2, 0.002 * want): break
+                self.ui(f"Repairing {n} missing spots (pass {ps+1}/{passes})...", 1.0)
+                draw([self.fine_layer(np.where(miss, idx, -1), s0, g, finest, mode)], "Repair", False)
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
-        except Exception as ex: msg = f"Error: {ex}"
+        except Exception as ex: self.log(traceback.format_exc()); msg = f"Error: {ex}"
         finally:
             try: m and m.up(g["button"])
             except Exception: pass
@@ -783,19 +919,21 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
     def finish(self, msg, beep):
         if self.mini: self.mini.destroy(); self.mini = None
         self.deiconify(); self.say(msg)
-        if beep and msg == "Done!":
+        if msg.startswith("Error"): messagebox.showerror("Auto Drawer", msg + "\n\nDetails are saved in autodrawer.log in your user folder.")
+        elif beep and msg.startswith("Done"):
             try:
                 import winsound; winsound.MessageBeep()
             except Exception: self.bell()
 
     # ---------- setup files ----------
     def cfg_dict(self):
-        return {"canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "settings": {k: v.get() for k, v in self.v.items()}}
+        return {"canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
 
     def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
+        self.undo_pos = tuple(d["undo_pos"]) if d.get("undo_pos") else None
         for k, val in d.get("settings", {}).items():
             if k in self.v:
                 try: self.v[k].set(val)
