@@ -66,7 +66,7 @@ class Mouse:
 BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
-                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush"]
+                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "layers", "labmatch"]
 
 
 class App((TkinterDnD.Tk if DND else tk.Tk)):
@@ -77,11 +77,13 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.palette, self.brushes = [], []
         self.stop = self.paused = self.drawing = False
         self.spd, self.t0 = 70.0, 0.0
-        self.hk = queue.Queue()
+        self.hk = queue.Queue(); self.rebind = None; self.keys = {}; self.keybtns = {}
         S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
         self.v = dict(
             speed=D(value=70), dragpts=I(value=3), hold=I(value=10), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
+            layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
+            hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
             invert=B(value=False), bright=D(value=1.0), contrast=D(value=1.0), sat=D(value=1.0), blur=D(value=0),
@@ -97,6 +99,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             keyboard.Listener(on_press=self.on_key).start()
         try: self.apply_cfg(json.load(open(CFG)))
         except Exception: pass
+        self.sync_keys()
+        for a in ("pause", "slower", "faster", "stop"): self.v["hk_" + a].trace_add("write", self.sync_keys)
         self.spd = float(self.v["speed"].get())
         self.v["speed"].trace_add("write", lambda *a: setattr(self, "spd", float(self.v["speed"].get())))
         self.v["ontop"].trace_add("write", lambda *a: self.attributes("-topmost", bool(self.v["ontop"].get())))
@@ -105,17 +109,45 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.refresh(); self.after(100, self.poll)
 
     # ---------- hotkeys ----------
+    @staticmethod
+    def key_name(k):
+        n = getattr(k, "name", None)
+        if n: return n
+        ch = getattr(k, "char", None)
+        return ch.lower() if ch and ch.isprintable() else None
+
     def on_key(self, k):
+        name = self.key_name(k)
+        if not name: return
+        if self.rebind:
+            self.hk.put(("bind", self.rebind, name)); self.rebind = None; return
         if not self.drawing: return
-        if k == keyboard.Key.esc: self.stop = True
-        elif k == keyboard.Key.f8: self.paused = not self.paused
-        elif k == keyboard.Key.f9: self.hk.put(-10)
-        elif k == keyboard.Key.f10: self.hk.put(10)
+        ks = self.keys
+        if name == ks.get("stop"): self.stop = True
+        elif name == ks.get("pause"): self.paused = not self.paused
+        elif name == ks.get("slower"): self.hk.put(("speed", -10))
+        elif name == ks.get("faster"): self.hk.put(("speed", 10))
 
     def poll(self):
         while not self.hk.empty():
-            self.v["speed"].set(max(1, min(100, self.v["speed"].get() + self.hk.get())))
+            m = self.hk.get()
+            if m[0] == "speed": self.v["speed"].set(max(1, min(100, self.v["speed"].get() + m[1])))
+            else: self.v["hk_" + m[1]].set(m[2]); self.say(f"Key set to {m[2].upper()}")
         self.after(100, self.poll)
+
+    def sync_keys(self, *a):
+        for act in ("pause", "slower", "faster", "stop"):
+            n = self.v["hk_" + act].get(); self.keys[act] = n
+            if act in self.keybtns and self.rebind != act: self.keybtns[act].config(text=n.upper())
+
+    def start_bind(self, act):
+        if not keyboard: return messagebox.showinfo("Keys", "Changing keybinds needs the 'pynput' package (it is included in the exe).")
+        self.rebind = act; self.keybtns[act].config(text="press a key..."); self.say("Press the new key now (works from anywhere).")
+
+    def reset_keys(self):
+        self.rebind = None
+        for a, d in (("pause", "f8"), ("slower", "f9"), ("faster", "f10"), ("stop", "esc")): self.v["hk_" + a].set(d)
+        self.sync_keys()
 
     # ---------- UI helpers ----------
     def style(self):
@@ -186,6 +218,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.cb = ttk.Combobox(r, textvariable=self.v["brush"], state="readonly", width=20); self.cb.pack(side="left", padx=4)
         ttk.Button(r, text="Clear", width=6, command=lambda: (self.brushes.clear(), self.refresh())).pack(side="right")
         self.spin(f, "Manual step px", "step", 1, 60)
+        self.spin(f, "Test line spacing px", "tspace", 0, 400, 5)
 
         r = tk.Frame(left, bg=BG); r.pack(fill="x", pady=4)
         for t, c in (("Preview", self.preview), ("Trace box", self.trace), ("Test line", self.test_stroke)):
@@ -232,6 +265,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         self.combo(t, "Fit", "fit", ["Fit (keep ratio)", "Stretch to canvas"])
         self.combo(t, "Stroke direction", "scan", ["Horizontal", "Vertical", "Serpentine"])
         self.combo(t, "Colour order", "corder", ["Palette order", "Lightest first", "Darkest first", "Most pixels first", "Fewest pixels first"])
+        self.check(t, "Layers: big brush first, small brush last", "layers")
+        self.check(t, "Re-click brush after each colour change", "rebrush")
+        self.check(t, "Perceptual colour matching (more accurate)", "labmatch")
         self.slider(t, "Remove specks (0-3)", "despeckle", 0, 3)
         self.check(t, "Dither colours (smoother blends)", "dither")
         self.check(t, "Skip white (keep canvas background)", "skipwhite")
@@ -240,8 +276,14 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         t = tabs["App"]
         self.check(t, "Hide this window while drawing", "minimize"); self.check(t, "Keep this window on top", "ontop")
         self.check(t, "Beep when finished", "beep")
-        ttk.Button(t, text="Reset all settings", command=self.reset).pack(anchor="w", pady=8)
-        ttk.Label(t, text="Hotkeys while drawing:\nF8  pause / resume\nF9  slower     F10  faster\nESC  stop\nTop-left screen corner = emergency stop\n\nYour setup is saved automatically on exit.", foreground="#999").pack(anchor="w")
+        ttk.Button(t, text="Reset all settings", command=self.reset).pack(anchor="w", pady=6)
+        ttk.Separator(t).pack(fill="x", pady=4)
+        ttk.Label(t, text="Keybinds (click a button, then press the new key)", style="H.TLabel").pack(anchor="w")
+        for act, lbl in (("pause", "Pause / resume"), ("slower", "Slower"), ("faster", "Faster"), ("stop", "Stop")):
+            r = self._row(t, lbl); b = ttk.Button(r, width=16, text=self.v["hk_" + act].get().upper(), command=lambda a=act: self.start_bind(a))
+            b.pack(side="left"); self.keybtns[act] = b
+        ttk.Button(t, text="Reset keybinds", command=self.reset_keys).pack(anchor="w", pady=4)
+        ttk.Label(t, text="Pick keys your drawing app doesn't use (F-keys are safest).\nTop-left screen corner = emergency stop.\nYour setup is saved automatically on exit.", foreground="#999").pack(anchor="w")
 
         self.prev = tk.Label(right, text="Preview", bg="#15161b", fg="#666"); self.prev.pack(fill="both", expand=True)
 
@@ -273,7 +315,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         if p: self.load_image(p)
 
     def load_image(self, p):
-        try: self.img = Image.open(p).convert("RGBA")
+        try: self.img = ImageOps.exif_transpose(Image.open(p)).convert("RGBA")
         except Exception as e: return messagebox.showerror("Error", str(e))
         self.drop.config(text=os.path.basename(p), fg=FG); self.refresh(); self.preview()
 
@@ -384,7 +426,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 self.ui(f"Measuring brush sizes in {s}s - keep your drawing app visible!"); time.sleep(1)
             for j, i in enumerate(idxs):
                 self.gate(); self.ui(f"Measuring brush {i+1} ({j+1}/{n})...", j / n)
-                yc = int(b[1] + H * (j + 1) / (n + 1)); half = int(min(150, max(6, H / (n + 1) / 2 - 3)))
+                sp = g["tspace"] if g["tspace"] > 0 else H / (n + 1)
+                yc = int(b[1] + sp * (j + 1))
+                if yc > b[3] - 4: sp = H / (n + 1); yc = int(b[1] + sp * (j + 1))   # spacing too big for canvas -> auto
+                half = int(min(150, max(6, sp / 2 - 3)))
                 x0, x1 = int(b[0] + W * 0.2), int(b[0] + W * 0.5); xm = (x0 + x1) // 2
                 box = (xm - 8, yc - half, xm + 9, yc + half + 1)
                 before = self.snap(box); bgc = before.getpixel((8, half))
@@ -456,11 +501,31 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         n = self.v["brush"].get(); names = self.brush_names()
         return self.brushes[names.index(n)] if n in names else None
 
+    def active_brushes(self):
+        valid = [b for b in self.brushes if b["px"] > 0]
+        if self.v["layers"].get() and len(valid) >= 2: return sorted(valid, key=lambda b: -b["px"])   # big -> small
+        b = self.cur_brush(); return [b] if b and b["px"] > 0 else []
+
     def step_px(self):
-        b = self.cur_brush(); return max(1, b["px"]) if b else max(1, int(self.v["step"].get()))
+        bs = self.active_brushes(); return min(b["px"] for b in bs) if bs else max(1, int(self.v["step"].get()))
 
     def eff_mode(self):
         m = self.v["mode"].get(); return ("Palette colours" if self.palette else "Black & white") if m == "Auto" else m
+
+    @staticmethod
+    def to_lab(a):
+        c = a / 255.0
+        c = np.where(c > 0.04045, ((c + 0.055) / 1.055) ** 2.4, c / 12.92)
+        xyz = (c @ np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]).T) / np.array([0.95047, 1.0, 1.08883])
+        f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+        return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+    @staticmethod
+    def nearest(arr, pal):
+        out = np.empty(arr.shape[:2], int)
+        for y in range(0, arr.shape[0], 64):
+            out[y:y+64] = ((arr[y:y+64, :, None, :] - pal[None, None]) ** 2).sum(3).argmin(2)
+        return out
 
     def build_grid(self):
         if self.img is None or self.canvas_box is None: raise ValueError("Add a reference image and select the canvas first.")
@@ -477,7 +542,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         else: w, h = cols * sz, rows * sz
         w, h = max(1, min(int(w), 1500)), max(1, min(int(h), 1500))
         big = 3 if mode == "Line art" else 1
-        bg = Image.new("RGBA", (w * big, h * big), (255, 255, 255, 0)); bg.alpha_composite(im.resize((w * big, h * big), Image.LANCZOS))
+        rs = Image.BOX if w * big <= im.width and h * big <= im.height else Image.BICUBIC   # area-average when shrinking
+        bg = Image.new("RGBA", (w * big, h * big), (255, 255, 255, 0)); bg.alpha_composite(im.resize((w * big, h * big), rs))
         alpha = np.array(bg)[:, :, 3] > 40
         rgb = bg.convert("RGB")
         if g["blur"] > 0: rgb = rgb.filter(ImageFilter.GaussianBlur(g["blur"] * big))
@@ -504,9 +570,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                             if x > 0: a[y+1, x-1] += err * 3 / 16
                             a[y+1, x] += err * 5 / 16
                             if x + 1 < w: a[y+1, x+1] += err / 16
-            else: out = ((arr[:, :, None, :] - pal[None, None]) ** 2).sum(3).argmin(2)
+            else: out = self.nearest(self.to_lab(arr), self.to_lab(pal)) if g["labmatch"] else self.nearest(arr, pal)
             skip = ~alpha
-            if g["skipwhite"]: skip |= gray > 240
+            if g["skipwhite"]: skip |= arr.min(2) > 235
             out = np.where(skip, -1, out)
         lvl = int(g["despeckle"])
         if lvl > 0:
@@ -520,8 +586,21 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         if hh > 0 and ww > 0: full[dy:dy+hh, dx:dx+ww] = out[sy:sy+hh, sx:sx+ww]
         return full, step
 
-    def make_plan(self, idx, g, mode):
-        pal = mode == "Palette colours"
+    def runs_from(self, grid, g):
+        vert, serp = g["scan"] == "Vertical", g["scan"] == "Serpentine"
+        mat = grid.T if vert else grid; runs = []
+        for r in range(mat.shape[0]):
+            d = np.diff(np.concatenate(([0], mat[r].astype(np.int8), [0])))
+            rs = list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1) - 1))
+            if serp and r % 2: rs = [(e, s) for s, e in reversed(rs)]
+            for s, e in rs:
+                s, e = int(s), int(e); runs.append(((r, s), (r, e)) if vert else ((s, r), (e, r)))
+        return runs
+
+    def make_plan(self, idx, g, mode, s0):
+        """Returns layers (big brush -> small brush). A big-brush layer only paints blocks that are ONE colour and not yet
+        painted, so strokes never run over other colours; whatever is left is filled by the smaller brushes."""
+        pal = mode == "Palette colours"; rows, cols = idx.shape
         cis = list(range(len(self.palette))) if pal else [0]
         counts = {c: int((idx == c).sum()) for c in cis}; cis = [c for c in cis if counts[c] > 0]
         lum = lambda c: sum(self.palette[c]["rgb"]) if pal else 0
@@ -530,19 +609,29 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         elif o == "Darkest first": cis.sort(key=lum)
         elif o == "Most pixels first": cis.sort(key=lambda c: -counts[c])
         elif o == "Fewest pixels first": cis.sort(key=lambda c: counts[c])
-        vert, serp = g["scan"] == "Vertical", g["scan"] == "Serpentine"
-        mat = idx.T if vert else idx; plan = []
-        for c in cis:
-            runs = []
-            for r in range(mat.shape[0]):
-                d = np.diff(np.concatenate(([0], (mat[r] == c).astype(np.int8), [0])))
-                rs = list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1) - 1))
-                if serp and r % 2: rs = [(e, s) for s, e in reversed(rs)]
-                for s, e in rs:
-                    s, e = int(s), int(e)
-                    runs.append(((r, s), (r, e)) if vert else ((s, r), (e, r)))
-            plan.append((c, runs))
-        return plan
+        layers = [(b, b["px"]) for b in self.active_brushes()] or [(None, s0)]
+        done = np.zeros(idx.shape, bool); fy = np.arange(rows) * s0 + s0 / 2; fx = np.arange(cols) * s0 + s0 / 2
+        vert = g["scan"] == "Vertical"; out = []
+        for li, (br, p) in enumerate(layers):
+            last = li == len(layers) - 1; per_colour = []
+            if not last:
+                R, C = (rows * s0) // p, (cols * s0) // p
+                ys = np.minimum((fy // p).astype(int), R); xs = np.minimum((fx // p).astype(int), C)
+                tot = np.zeros((R + 1, C + 1), int); np.add.at(tot, (ys[:, None], xs[None, :]), 1)
+            for c in cis:
+                mask = (idx == c) & ~done
+                if not mask.any(): continue
+                if last: grid = mask; done |= mask
+                else:
+                    cnt = np.zeros((R + 1, C + 1), int); np.add.at(cnt, (ys[:, None], xs[None, :]), mask.astype(int))
+                    full = (cnt == tot) & (tot > 0); full[R, :] = False; full[:, C] = False
+                    pad = np.pad(full, 1)   # lone cells are left for finer brushes (a round tip would leave gaps)
+                    full &= (pad[:-2, 1:-1] | pad[2:, 1:-1]) if vert else (pad[1:-1, :-2] | pad[1:-1, 2:])
+                    done |= mask & full[ys[:, None], xs[None, :]]; grid = full[:R, :C]
+                runs = self.runs_from(grid, g)
+                if runs: per_colour.append((c, runs))
+            out.append({"brush": br, "step": s0 if last else p, "colours": per_colour})
+        return out
 
     def timing(self):
         s = self.spd / 100.0
@@ -562,9 +651,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         im = Image.fromarray(px); sc = min(560 / im.width, 700 / im.height)
         im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.NEAREST)
         self.tkp = ImageTk.PhotoImage(im); self.prev.config(image=self.tkp, text="")
-        plan = self.make_plan(self.idx, {k: v.get() for k, v in self.v.items()}, mode)
-        n = sum(len(r) for _, r in plan); pause, dur = self.timing(); est = n * (2 * pause + dur + 0.03)
-        self.say(f"{mode} | {n} strokes | brush/step {step}px | est. time at current speed ~{int(est//60)}m {int(est%60)}s")
+        plan = self.make_plan(self.idx, {k: v.get() for k, v in self.v.items()}, mode, step)
+        n = sum(len(r) for l in plan for _, r in l["colours"]); pause, dur = self.timing(); est = n * (2 * pause + dur + 0.03)
+        self.say(f"{mode} | {len(plan)} layer(s) | {n} strokes | finest brush {step}px | est. ~{int(est//60)}m {int(est%60)}s at current speed")
 
     # ---------- drawing ----------
     def click(self, m, x, y, wait=0.15):
@@ -626,7 +715,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Button(r, text="Stop", command=lambda: setattr(self, "stop", True)).pack(side="left", expand=True, fill="x", padx=2)
         r = ttk.Frame(m); r.pack(fill="x", padx=10); ttk.Label(r, text="Speed").pack(side="left")
         ttk.Scale(r, from_=1, to=100, variable=self.v["speed"]).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Label(m, text="F8 pause · F9 slower · F10 faster · ESC stop", foreground="#999").pack(pady=6)
+        k = self.keys; ttk.Label(m, text=f"{k['pause'].upper()} pause · {k['slower'].upper()} slower · {k['faster'].upper()} faster · {k['stop'].upper()} stop", foreground="#999").pack(pady=6)
 
     def set_progress(self, frac, text):
         if not self.mini: return
@@ -640,12 +729,12 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         try: self.idx, step = self.build_grid()
         except ValueError as e: return messagebox.showinfo("Setup", str(e))
         g = {k: v.get() for k, v in self.v.items()}; mode = self.eff_mode()
-        plan = self.make_plan(self.idx, g, mode)
-        if not plan: return messagebox.showinfo("Nothing to draw", "Nothing to draw with these settings.")
-        brush = self.cur_brush(); self.stop = self.paused = False; self.drawing = True
+        plan = self.make_plan(self.idx, g, mode, step)
+        if not any(l["colours"] for l in plan): return messagebox.showinfo("Nothing to draw", "Nothing to draw with these settings.")
+        self.stop = self.paused = False; self.drawing = True
         self.open_mini()
         if g["minimize"]: self.withdraw()
-        threading.Thread(target=self.run, args=(plan, step, g, brush, mode), daemon=True).start()
+        threading.Thread(target=self.run, args=(plan, g, mode), daemon=True).start()
 
     def gate(self):
         if tuple(pyautogui.position()) == (0, 0): raise pyautogui.FailSafeException()
@@ -656,29 +745,33 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             self.t0 += time.time() - p0
             if self.stop: raise KeyboardInterrupt
 
-    def run(self, plan, step, g, brush, mode):
+    def run(self, plan, g, mode):
         msg, m = "Done!", None
         try:
             m = Mouse(g["input"].startswith("Windows")); bx, by = self.canvas_box[:2]
             for s in range(g["countdown"], 0, -1):
                 if self.stop: raise KeyboardInterrupt
                 self.ui(f"Starting in {s}s - click on your drawing app now!"); time.sleep(1)
-            weight = lambda r: abs(r[1][0] - r[0][0]) + abs(r[1][1] - r[0][1]) + 1
-            total = max(1, sum(weight(r) for _, runs in plan for r in runs)); done, last = 0, 0
+            total = max(1, sum(len(r) for l in plan for _, r in l["colours"])); done, last = 0, 0
             self.t0 = time.time()
-            if brush: self.click(m, *brush["pos"], g["swdelay"])
-            for ci, runs in plan:
+            for li, layer in enumerate(plan):
+                p, br = layer["step"], layer["brush"]
+                if not layer["colours"]: continue
                 self.gate()
-                if mode == "Palette colours": self.click(m, *self.palette[ci]["pos"], g["swdelay"])
-                for a, b in runs:
-                    self.gate(); pause, dur = self.timing()
-                    self.stroke(m, bx + a[0] * step + step // 2, by + a[1] * step + step // 2,
-                                bx + b[0] * step + step // 2, by + b[1] * step + step // 2, g, dur)
-                    if pause: time.sleep(pause)
-                    done += weight((a, b))
-                    if time.time() - last > 0.25:
-                        last = time.time(); el = last - self.t0; rem = el / done * (total - done) if done else 0
-                        self.ui(f"{done*100//total}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", done / total)
+                if br: self.click(m, *br["pos"], g["swdelay"])
+                for ci, runs in layer["colours"]:
+                    self.gate()
+                    if mode == "Palette colours": self.click(m, *self.palette[ci]["pos"], g["swdelay"])
+                    if br and g["rebrush"]: self.click(m, *br["pos"], g["swdelay"])
+                    for a, b in runs:
+                        self.gate(); pause, dur = self.timing()
+                        self.stroke(m, bx + a[0] * p + p // 2, by + a[1] * p + p // 2,
+                                    bx + b[0] * p + p // 2, by + b[1] * p + p // 2, g, dur)
+                        if pause: time.sleep(pause)
+                        done += 1
+                        if time.time() - last > 0.25:
+                            last = time.time(); el = last - self.t0; rem = el / done * (total - done)
+                            self.ui(f"Layer {li+1}/{len(plan)} | {done*100//total}% | {int(rem//60)}m {int(rem%60)}s left | speed {int(self.spd)}", done / total)
         except KeyboardInterrupt: msg = "Stopped."
         except pyautogui.FailSafeException: msg = "Stopped (failsafe corner)."
         except Exception as ex: msg = f"Error: {ex}"
