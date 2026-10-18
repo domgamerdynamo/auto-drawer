@@ -67,7 +67,7 @@ BG, CARD, FG, ACC, OK = "#1e1f26", "#2a2c36", "#e8e8ee", "#4f8cff", "#4ade80"
 CFG = os.path.join(os.path.expanduser("~"), ".autodrawer.json")
 ORDERS = ["Layers (big brush → small brush)", "One colour at a time", "One row at a time (all colours per row)"]
 PREVIEW_KEYS = ["mode", "fit", "scale", "offx", "offy", "flipx", "flipy", "rot", "invert", "bright", "contrast",
-                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "order", "labmatch", "overlap"]
+                "sat", "blur", "thr", "dither", "skipwhite", "despeckle", "step", "brush", "order", "labmatch", "overlap", "margin"]
 
 
 class App((TkinterDnD.Tk if DND else tk.Tk)):
@@ -85,7 +85,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             speed=D(value=70), dragpts=I(value=3), hold=I(value=20), swdelay=D(value=0.15), button=S(value="left"),
             input=S(value="Windows SendInput (best)"), nudge=B(value=True), undo=B(value=True),
             layers=B(value=True), rebrush=B(value=False), labmatch=B(value=True), tspace=I(value=0),
-            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), overlap=D(value=10), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
+            maxstep=I(value=8), settle=I(value=20), lift=I(value=25), margin=I(value=1), fixwrong=B(value=False), overlap=D(value=0), repair=I(value=4), tol=D(value=22), autobrush=B(value=True), showlayer=S(value="All layers"), order=S(value=ORDERS[0]),
             hk_pause=S(value="f8"), hk_slower=S(value="f9"), hk_faster=S(value="f10"), hk_stop=S(value="esc"),
             countdown=I(value=4), mode=S(value="Auto"), fit=S(value="Fit (keep ratio)"), scale=D(value=100),
             offx=D(value=0), offy=D(value=0), flipx=B(value=False), flipy=B(value=False), rot=S(value="0°"),
@@ -280,8 +280,10 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         ttk.Label(t, text="Layers: big brush fills solid areas first, small brush adds detail (needs 2+ brushes).\nOne colour at a time: finish a whole colour before the next.\nOne row at a time: complete each row (every colour in it) before the next row.", foreground="#999", wraplength=360, justify="left").pack(anchor="w", pady=2)
         self.check(t, "Re-click brush after each colour change", "rebrush")
         self.check(t, "Perceptual colour matching (more accurate)", "labmatch")
-        self.slider(t, "Stroke overlap %", "overlap", 0, 40)
+        self.slider(t, "Overlap % (0=no overdraw)", "overlap", 0, 40)
+        self.spin(t, "Layer safety margin", "margin", 0, 4)
         self.spin(t, "Repair passes (0-5)", "repair", 0, 5)
+        self.check(t, "Repair wrong colours too (can redraw edges)", "fixwrong")
         self.slider(t, "Repair tolerance", "tol", 8, 50)
         self.slider(t, "Remove specks (0-3)", "despeckle", 0, 3)
         self.check(t, "Dither colours (smoother blends)", "dither")
@@ -712,6 +714,13 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         return runs
 
     @staticmethod
+    def erode(m, k):
+        for _ in range(k):
+            p = np.pad(m, 1, constant_values=False)
+            m = p[1:-1, 1:-1] & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:] & p[:-2, :-2] & p[:-2, 2:] & p[2:, :-2] & p[2:, 2:]
+        return m
+
+    @staticmethod
     def by_row(per_colour, cis, vert):
         rows = {}
         for c, runs in per_colour:
@@ -749,7 +758,8 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 if not mask.any(): continue
                 if last: grid = mask; done |= mask
                 else:
-                    cnt = np.zeros((R + 1, C + 1), int); np.add.at(cnt, (ys[:, None], xs[None, :]), mask.astype(int))
+                    me = mask & self.erode(idx == c, int(g["margin"]))      # keep clear of other colours / the canvas edge
+                    cnt = np.zeros((R + 1, C + 1), int); np.add.at(cnt, (ys[:, None], xs[None, :]), me.astype(int))
                     full = (cnt == tot) & (tot > 0); full[R, :] = False; full[:, C] = False
                     pad = np.pad(full, 1)   # lone cells are left for finer brushes (a round tip would leave gaps)
                     full &= (pad[:-2, 1:-1] | pad[2:, 1:-1]) if vert else (pad[1:-1, :-2] | pad[1:-1, 2:])
@@ -952,7 +962,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
             return a[:, lo:hi, :, lo:hi].mean((1, 3))
         except Exception: self.log(traceback.format_exc()); return None
 
-    def find_missing(self, idx, obs, before, pal_rgb, tol):
+    def find_missing(self, idx, obs, before, pal_rgb, tol, gaps_only=False):
         lab = self.to_lab(obs); want = idx >= 0
         if pal_rgb:
             exp = np.array(pal_rgb, float); labb = self.to_lab(before) if before is not None else None
@@ -965,7 +975,9 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
         else:
             if before is None: return np.zeros(idx.shape, bool)
             ok = np.linalg.norm(lab - self.to_lab(before), axis=2) > 12
-        return want & ~ok
+        miss = want & ~ok
+        if gaps_only and before is not None: miss &= np.linalg.norm(lab - self.to_lab(before), axis=2) < 15   # still blank = a real gap
+        return miss
 
     def fine_layer(self, idx_m, s0, g, brush, mode):
         cis = [c for c in (range(len(self.palette)) if mode == "Palette colours" else [0]) if (idx_m == c).any()]
@@ -1021,7 +1033,7 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
                 self.park(m); time.sleep(0.3)
                 obs = look()
                 if obs is None: msg = "Done (couldn't read the canvas to check it)."; break
-                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"]); n = int(miss.sum()); final = n
+                miss = self.find_missing(idx, obs, before, pal_rgb, g["tol"], before is not None and not g["fixwrong"]); n = int(miss.sum()); final = n
                 self.log(f"check {ps+1}: {n} of {want} spots missing (speed {int(self.spd)}, hold {g['hold']}, settle {g['settle']}, step {g['maxstep']})")
                 if not repair_only and ps == 0 and n / want > 0.7: final = None; msg = "Done (the canvas check didn't match what was drawn, so repair was skipped)."; break
                 if n <= max(2, 0.002 * want) or ps == passes: break
@@ -1054,16 +1066,16 @@ class App((TkinterDnD.Tk if DND else tk.Tk)):
 
     # ---------- setup files ----------
     def cfg_dict(self):
-        return {"ver": 5, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
+        return {"ver": 6, "canvas": self.canvas_box, "palette": self.palette, "brushes": self.brushes, "undo_pos": self.undo_pos, "settings": {k: v.get() for k, v in self.v.items()}}
 
     def apply_cfg(self, d):
         self.canvas_box = tuple(d["canvas"]) if d.get("canvas") else None
         self.palette = [{"pos": tuple(x["pos"]), "rgb": tuple(x["rgb"])} for x in d.get("palette", [])]
         self.brushes = [{"pos": tuple(x["pos"]), "px": x["px"]} for x in d.get("brushes", [])]
         self.undo_pos = tuple(d["undo_pos"]) if d.get("undo_pos") else None
-        old = d.get("ver", 0) < 5
+        old = d.get("ver", 0) < 6
         for k, val in d.get("settings", {}).items():
-            if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift"): continue
+            if old and k in ("hold", "settle", "maxstep", "dragpts", "repair", "lift", "margin", "overlap"): continue
             if k in self.v:
                 try: self.v[k].set(val)
                 except Exception: pass
